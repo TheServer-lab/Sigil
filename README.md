@@ -54,7 +54,7 @@ python3 -m sigil.runtime examples/hello.sig
 
 ---
 
-## Project layout (suggested)
+## Project layout 
 
 ```
 sigil/
