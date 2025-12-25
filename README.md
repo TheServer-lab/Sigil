@@ -39,7 +39,7 @@ Sigil is an experimental, extensible scripting language and runtime focused on s
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/sigil.git
+git clone https://github.com/TheServer-lab/sigil.git
 cd sigil
 ```
 
