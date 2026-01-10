@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Sigil engine — full version with:
-- persistent aliases/variables stored in C:\\Sigil (per-profile .sigilrc files)
+Sigil engine — full version (single-file)
+Includes:
+- persistent aliases/variables stored in C:\Sigil (per-profile .sigilrc files)
 - profile management (prof)
-- save/reload rc (svrc, rrc)
 - many utility commands
-- 'pse [message]' pause command (optional message)
-- Plugin system: .sigin packages, pin/prv commands, plugin registration
+- simple shell bridges: ps, cmd (alias cp), sh
+- variables, let/ask sugar, single-quote shorthand
+- rpt loops, exists, arg, script.dir/file
+- comments via &, #, //, /* ... */
 """
 
 from __future__ import annotations
@@ -20,8 +22,6 @@ import time
 import random
 import webbrowser
 from typing import List, Tuple
-
-# added imports for plugin system
 import zipfile
 import runpy
 import json
@@ -45,17 +45,20 @@ except Exception:
 # =============================
 # Global state / config directory
 # =============================
-# User requested: store .sigilrc files in C:\Sigil
 SIGIL_CONFIG_DIR = os.path.abspath(r"C:\Sigil")
 os.makedirs(SIGIL_CONFIG_DIR, exist_ok=True)
 
-# plugin directory
 PLUGIN_DIR = os.path.join(SIGIL_CONFIG_DIR, "plugins")
 os.makedirs(PLUGIN_DIR, exist_ok=True)
 _PLUGIN_REGISTRY_PATH = os.path.join(PLUGIN_DIR, "plugins.json")
 
 CURRENT_PROFILE = "default"
 CURRENT_DIR = os.getcwd()
+
+# script-related info (set when running a script)
+SCRIPT_FILE: str = ""
+SCRIPT_DIR: str = ""
+SCRIPT_ARGS: List[str] = []
 
 UNDO_STACK: List[dict] = []
 REDO_STACK: List[dict] = []
@@ -65,30 +68,24 @@ os.makedirs(UNDO_BASE, exist_ok=True)
 
 ALIASES: dict = {}     # name -> command string
 VARIABLES: dict = {}   # name -> value (str/int/float)
+EXPORTED_VARS: set = set()   # names exported to OS env
+READONLY_VARS: set = set()   # names marked readonly via let -r
 
 LOADING_RC = False  # guard: true while load_sigilrc is running
 
-# plugin runtime registry (in-memory)
-# plugin_name -> {
-#   "archive": "<path to .sigin>",
-#   "extract_dir": "<path to extracted files>",
-#   "commands": ["cmd1","cmd2"],
-#   "info": {...}
-# }
 PLUGIN_REGISTRY: dict = {}
 
 # =============================
-# Helpers
+# Helpers: rc persistence
 # =============================
 def rc_path(profile: str | None = None) -> str:
-    """Return the full path to the active profile's rc file in SIGIL_CONFIG_DIR."""
     name = profile or CURRENT_PROFILE
     if name == "default":
         return os.path.join(SIGIL_CONFIG_DIR, ".sigilrc")
     return os.path.join(SIGIL_CONFIG_DIR, f".sigilrc.{name}")
 
 def save_sigilrc() -> None:
-    """Write current ALIASES and VARIABLES to the active profile rc file."""
+    """Write current ALIASES, VARIABLES and metadata to the active profile rc file."""
     path = rc_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -96,11 +93,9 @@ def save_sigilrc() -> None:
             f.write(f"# Sigil RC — profile: {CURRENT_PROFILE}\n")
             f.write("# Aliases\n")
             for k, v in ALIASES.items():
-                # write alias as: alia name <command...>
                 f.write(f"alia {k} {v}\n")
             f.write("\n# Variables\n")
             for k, v in VARIABLES.items():
-                # write let name = value
                 if isinstance(v, str):
                     needs_quote = any(ch.isspace() for ch in v) or v == ""
                     v_escaped = v.replace('"', '\\"')
@@ -109,13 +104,19 @@ def save_sigilrc() -> None:
                     else:
                         f.write(f"let {k} = {v_escaped}\n")
                 else:
-                    # number types
                     f.write(f"let {k} = {v}\n")
+            # record readonly list
+            if READONLY_VARS:
+                for name in sorted(READONLY_VARS):
+                    f.write(f"let -r {name} = {VARIABLES.get(name, '')}\n")
+            # record exported (best-effort)
+            if EXPORTED_VARS:
+                for name in sorted(EXPORTED_VARS):
+                    f.write(f"export {name}\n")
     except Exception as e:
         print(f"Failed to save .sigilrc: {e}")
 
 def load_sigilrc() -> None:
-    """Load and execute commands from the active profile rc file."""
     global LOADING_RC
     path = rc_path()
     if not os.path.exists(path):
@@ -182,12 +183,14 @@ def tokenize(line: str) -> List[str]:
     return tokens
 
 def strip_comments_from_line(line: str, in_block_comment: bool) -> Tuple[str, bool]:
+    # New behavior: support '&' as comment starter (kid-friendly), plus existing //, #, /* */
     if in_block_comment:
         end_idx = line.find("*/")
         if end_idx == -1:
             return "", True
         line = line[end_idx+2:]
         in_block_comment = False
+    # handle block comments /* ... */
     while True:
         start_idx = line.find("/*")
         if start_idx == -1:
@@ -199,6 +202,10 @@ def strip_comments_from_line(line: str, in_block_comment: bool) -> Tuple[str, bo
             break
         else:
             line = line[:start_idx] + line[end_idx+2:]
+    # if first non-space character is '&', treat entire line as comment
+    stripped_line = line.lstrip()
+    if stripped_line.startswith('&'):
+        return "", in_block_comment
     result = []
     in_quotes = False
     i = 0
@@ -214,19 +221,75 @@ def strip_comments_from_line(line: str, in_block_comment: bool) -> Tuple[str, bo
                 break
             if c == '#':
                 break
+            if c == '&':
+                break
         result.append(c)
         i += 1
     stripped = "".join(result).rstrip()
     return stripped, in_block_comment
 
 # =============================
-# Alias & variable expansion
+# Variable interpolation helpers
 # =============================
+_varname_re = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+def expand_vars_in_string(s: str) -> str:
+    """Expand $name and ${name} inside the given string using VARIABLES then os.environ.
+       If not found, leave empty string for $name or preserve original? We'll use empty string fallback.
+    """
+    out = []
+    i = 0
+    L = len(s)
+    while i < L:
+        c = s[i]
+        if c == '\\\\' and i + 1 < L:
+            out.append(s[i+1])
+            i += 2
+            continue
+        if c == '$':
+            # ${name} or $name
+            if i + 1 < L and s[i+1] == '{':
+                j = s.find('}', i+2)
+                if j == -1:
+                    # no close, treat literally
+                    out.append(s[i])
+                    i += 1
+                    continue
+                name = s[i+2:j]
+                val = VARIABLES.get(name, os.environ.get(name, ""))
+                out.append(str(val))
+                i = j + 1
+                continue
+            else:
+                # parse bare name
+                j = i + 1
+                match = _varname_re.match(s[j:])  # match from j
+                if match:
+                    name = match.group(0)
+                    val = VARIABLES.get(name, os.environ.get(name, ""))
+                    out.append(str(val))
+                    i = j + len(name)
+                    continue
+                else:
+                    # solitary $, keep
+                    out.append('$')
+                    i += 1
+                    continue
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+def _safe_plugin_name(name: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_\-]', '_', name).strip('_')
+
 def expand_aliases_and_vars(line: str) -> str:
     """Expand alias (if first token is alias) and substitute variables.
-       Variables expand in two forms:
-       - $name replaced by its value (stringified)
-       - bare token equal to a variable name -> replaced
+       Variables expand in forms:
+       - single-quoted token 'name' -> replaced by variable value (shorthand)
+       - double-quoted strings have interpolation inside
+       - $name and ${name} anywhere inside tokens
+       - bare token equal to variable name -> replaced
     """
     tokens = tokenize(line)
     if not tokens:
@@ -239,33 +302,28 @@ def expand_aliases_and_vars(line: str) -> str:
         new_line = alias_cmd
         if rest:
             new_line = alias_cmd + " " + " ".join(rest)
-        return expand_aliases_and_vars(new_line)  # recursive in case alias maps to alias
-    # variable substitution
+        return expand_aliases_and_vars(new_line)
     new_tokens = []
     for t in tokens:
-        replaced = False
-        # quoted token
-        if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        # single-quoted token: treat as variable reference shorthand
+        if len(t) >= 2 and t[0] == "'" and t[-1] == "'":
             inner = t[1:-1]
             if inner in VARIABLES:
-                v = VARIABLES[inner]
-                if isinstance(v, str):
-                    new_tokens.append('"' + str(v).replace('"', '\\"') + '"')
-                else:
-                    new_tokens.append(str(v))
-                replaced = True
+                new_tokens.append(str(VARIABLES[inner]))
+            elif inner in os.environ:
+                new_tokens.append(os.environ[inner])
             else:
-                new_tokens.append(t)
-                replaced = True
-        if replaced:
+                new_tokens.append(inner)
             continue
-        # $var form
-        if t.startswith("$"):
-            key = t[1:]
-            if key in VARIABLES:
-                new_tokens.append(str(VARIABLES[key]))
-            else:
-                new_tokens.append(t)
+        # double-quoted: interpolate inside and keep quotes
+        if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+            inner = t[1:-1]
+            inner_expanded = expand_vars_in_string(inner)
+            new_tokens.append('"' + inner_expanded.replace('"', '\\"') + '"')
+            continue
+        # token contains $ => expand within token
+        if '$' in t:
+            new_tokens.append(expand_vars_in_string(t))
             continue
         # bare var name
         if t in VARIABLES:
@@ -278,7 +336,7 @@ def expand_aliases_and_vars(line: str) -> str:
 # Help text
 # =============================
 HELP_TEXT = {
-    "help": "help [command]\n  Show all commands or help for a specific command\n\nComments: # single-line, // single-line, /* ... */ block comments",
+    "help": "help [command]\n  Show all commands or help for a specific command\n\nComments: & single-line, # single-line, // single-line, /* ... */ block comments",
     "mk": "mk dir <name>\nmk file <name.ext> [content]\n  Create a directory or file",
     "cpy": "cpy <src> <dst>\n  Copy a file or directory",
     "dlt": "dlt <path>\n  Delete a file or directory (undoable)",
@@ -304,7 +362,7 @@ HELP_TEXT = {
     "div": "div <n1> <n2> [<n3> ...]\n  Divide numbers (n1 / n2 / n3 ...).",
     "alia": "alia <name> <command>  or  alia  (list aliases)",
     "unalia": "unalia <name>\n  Remove alias",
-    "let": "let <name> = <value>\n  Define a variable (string or number). Use variable by name or $name.",
+    "let": "let <name> = <value>\n  Define a variable (string or number). Use variable by name or $name.\n  Also: let name  (declare empty), let -r name = value (readonly), let name = ask \"Prompt\"",
     "var": "var\n  List variables",
     "unset": "unset <name>\n  Remove variable",
     "if": "if <cond> then <cmd>\n  Conditional execution. cond examples: exists <path>, 5 > 3, name == \"bob\"",
@@ -321,9 +379,15 @@ HELP_TEXT = {
     "rrc": "rrc  Reload active .sigilrc",
     "svrc": "svrc  Save active .sigilrc",
     "pse": "pse [message]  Pause — print optional message then wait for key (Windows) or Enter (other OSs)",
-    # plugin commands
-    "pin": "pin <path-to-plugin.sigin>  Install a plugin from a .sigin archive.  pin  (no args) lists installed plugins",
-    "prv": "prv <name>  Remove/uninstall plugin by name"
+    "ps": "ps [command]\n  Run a PowerShell command (or open interactive PowerShell if no args)",
+    "cmd": "cmd [command]\n  Run a Command Prompt (cmd.exe) command (or open interactive cmd if no args)",
+    "cp": "cp [command]\n  Shortcut for Command Prompt (cmd.exe)",
+    "sh": "sh [command]\n  Run a POSIX shell command (or open interactive shell if no args)",
+    "rpt": "rpt <count|inf> <command...>  or block form with endrpt\n  Repeat a command multiple times (rpt 10 say hi) or forever (rpt inf).",
+    "ask": "ask <name> [prompt]\n  Prompt the user and store input in variable <name> (also supports ask = name)",
+    "exit": "exit [code]\n  Exit Sigil with optional exit code",
+    "exists": "exists <path>\n  Print 'yes' if path exists, 'no' otherwise; sets last=0 for yes, last=1 for no",
+    "arg": "arg <n> | arg count\n  Access script arguments (1-based); 'arg count' returns number of arguments",
 }
 
 # =============================
@@ -345,22 +409,20 @@ def _parse_numbers(args: List[str]) -> List[float | int]:
             else:
                 nums.append(int(t))
         except Exception:
-            nums.append(float(t))
+            try:
+                nums.append(float(t))
+            except Exception:
+                nums.append(0)
     return nums
 
 # =============================
-# Plugin helpers
+# Plugin helpers (kept minimal)
 # =============================
-def _safe_plugin_name(name: str) -> str:
-    # produce filename-friendly plugin name
-    return re.sub(r'[^A-Za-z0-9_\-]', '_', name).strip('_')
-
 def _save_registry():
     try:
         with open(_PLUGIN_REGISTRY_PATH, "w", encoding="utf-8") as f:
             json.dump(PLUGIN_REGISTRY, f, indent=2)
     except Exception:
-        # best-effort only
         pass
 
 def _load_registry():
@@ -375,10 +437,6 @@ def _load_registry():
         PLUGIN_REGISTRY = {}
 
 def _plugin_extract_and_register(archive_path: str, name_hint: str | None = None) -> dict:
-    """
-    Extracts archive_path (.sigin ZIP) to PLUGIN_DIR/<name>
-    Returns plugin metadata dict (name, archive, extract_dir, commands, info)
-    """
     if not os.path.exists(archive_path):
         raise FileNotFoundError("Archive not found")
     base = os.path.basename(archive_path)
@@ -386,7 +444,6 @@ def _plugin_extract_and_register(archive_path: str, name_hint: str | None = None
     raw_name = name_hint or base_noext
     plugin_name = _safe_plugin_name(raw_name)
     extract_dir = os.path.join(PLUGIN_DIR, plugin_name)
-    # ensure unique if exists already by suffixing a number
     if os.path.exists(extract_dir):
         idx = 1
         while os.path.exists(extract_dir + f"_{idx}"):
@@ -400,38 +457,30 @@ def _plugin_extract_and_register(archive_path: str, name_hint: str | None = None
     except zipfile.BadZipFile as e:
         shutil.rmtree(extract_dir, ignore_errors=True)
         raise e
-    # attempt to read plugin-main.py metadata if present
     info = {}
     pm_path = os.path.join(extract_dir, "plugin-main.py")
     if os.path.exists(pm_path):
         try:
             g = runpy.run_path(pm_path, run_name="__sigil_plugin_info__")
-            # plugin can expose PLUGIN_INFO dict
             if "PLUGIN_INFO" in g and isinstance(g["PLUGIN_INFO"], dict):
                 info = g["PLUGIN_INFO"]
-                # prefer explicit name if provided
                 if "name" in info:
                     plugin_name = _safe_plugin_name(info["name"])
-                    # rename extract_dir if needed
                     desired_dir = os.path.join(PLUGIN_DIR, plugin_name)
                     if desired_dir != extract_dir:
                         if os.path.exists(desired_dir):
-                            # avoid clobber; keep current extract_dir
                             pass
                         else:
                             shutil.move(extract_dir, desired_dir)
                             extract_dir = desired_dir
         except Exception:
-            # plugin-main may perform install-time logic; ignore here for info read
             pass
-    # ensure archive is copied into PLUGIN_DIR with canonical name
     archive_dest = os.path.join(PLUGIN_DIR, plugin_name + ".sigin")
     try:
         if os.path.abspath(archive_path) != os.path.abspath(archive_dest):
             shutil.copy2(archive_path, archive_dest)
     except Exception:
         pass
-    # register minimal entry
     plugin_entry = {
         "archive": os.path.abspath(archive_dest),
         "extract_dir": os.path.abspath(extract_dir),
@@ -441,9 +490,6 @@ def _plugin_extract_and_register(archive_path: str, name_hint: str | None = None
     return plugin_name, plugin_entry
 
 def _load_plugin_commands(plugin_name: str, plugin_entry: dict):
-    """Load plugin.py from plugin_entry['extract_dir'] and call register(COMMANDS, helpers)
-       If register returns a dict of commands, add them to COMMANDS and record mapping.
-    """
     pdir = plugin_entry.get("extract_dir")
     if not pdir or not os.path.isdir(pdir):
         return
@@ -452,51 +498,40 @@ def _load_plugin_commands(plugin_name: str, plugin_entry: dict):
         return
     try:
         g = runpy.run_path(plugin_py, run_name=f"__sigil_plugin_{plugin_name}__")
-        # look for register function
         if "register" in g and callable(g["register"]):
-            # provide helper API to plugin
             helpers = {
                 "config_dir": SIGIL_CONFIG_DIR,
                 "plugin_dir": PLUGIN_DIR,
                 "resolve": resolve,
             }
             reg_result = g["register"](COMMANDS, helpers)
-            # register may return list of commands it added, or dict mapping
             added_cmds = []
             if isinstance(reg_result, dict):
-                # reg_result is mapping name->callable
                 for name, fn in reg_result.items():
                     if callable(fn):
                         COMMANDS[name] = fn
                         added_cmds.append(name)
             elif isinstance(reg_result, list):
-                # assume it's list of names (already registered inside plugin)
                 for name in reg_result:
                     if name in COMMANDS:
                         added_cmds.append(name)
-            # if plugin provided a 'COMMANDS' dict in its globals, register those too
             if "COMMANDS" in g and isinstance(g["COMMANDS"], dict):
                 for name, fn in g["COMMANDS"].items():
                     if callable(fn):
                         COMMANDS[name] = fn
                         added_cmds.append(name)
-            # persist recorded commands
             plugin_entry["commands"] = sorted(set(plugin_entry.get("commands", []) + added_cmds))
     except Exception as e:
         print(f"Plugin '{plugin_name}' load error: {e}")
 
 def load_plugins_on_startup():
-    """Load plugin registry file, then load plugin commands for each registered plugin."""
     _load_registry()
-    # load any discovered archives/extracted dirs that are not in registry
-    # scan PLUGIN_DIR for .sigin files and folders
     try:
         for item in os.listdir(PLUGIN_DIR):
             p = os.path.join(PLUGIN_DIR, item)
             if item.endswith(".sigin"):
                 name = os.path.splitext(item)[0]
                 if name not in PLUGIN_REGISTRY:
-                    # we have an orphaned archive: try extract to folder name
                     try:
                         _, entry = _plugin_extract_and_register(p, name_hint=name)
                         PLUGIN_REGISTRY[name] = entry
@@ -505,7 +540,6 @@ def load_plugins_on_startup():
             elif os.path.isdir(p):
                 name = item
                 if name not in PLUGIN_REGISTRY:
-                    # create entry pointing to this folder
                     archive_guess = os.path.join(PLUGIN_DIR, name + ".sigin")
                     entry = {"archive": os.path.abspath(archive_guess) if os.path.exists(archive_guess) else "",
                              "extract_dir": os.path.abspath(p),
@@ -514,111 +548,78 @@ def load_plugins_on_startup():
                     PLUGIN_REGISTRY[name] = entry
     except Exception:
         pass
-
-    # now attempt to load plugin.py for each plugin
     for name, entry in list(PLUGIN_REGISTRY.items()):
         try:
             _load_plugin_commands(name, entry)
         except Exception:
             pass
-    # store registry back
     _save_registry()
 
-def install_plugin_from_path(path: str):
-    """Install a plugin from a .sigin archive path."""
-    if not os.path.exists(path):
-        print("Plugin archive not found:", path)
+# =============================
+# Simple shell helpers (no flags)
+# =============================
+def _run_and_print(cmd_list: List[str], interactive: bool = False) -> int:
+    try:
+        if interactive:
+            cp = subprocess.run(cmd_list)
+            rc = cp.returncode if hasattr(cp, 'returncode') else 0
+        else:
+            cp = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out = cp.stdout.decode(errors='replace')
+            err = cp.stderr.decode(errors='replace')
+            if out:
+                print(out, end='')
+            if err:
+                print(err, end='', flush=True)
+            rc = cp.returncode
+    except FileNotFoundError:
+        print(f"Shell not found: {cmd_list[0]}")
+        rc = 127
+    except Exception as e:
+        print(f"Error running subprocess: {e}")
+        rc = 1
+    set_last(rc)
+    return int(rc)
+
+def cmd_ps(args: List[str]):
+    pwsh = shutil.which('pwsh') or shutil.which('powershell')
+    if not pwsh:
+        print("PowerShell not found on PATH")
+        set_last(127)
         return
-    # if path is a directory (user pointed to extracted folder), we can accept it too:
-    if os.path.isdir(path):
-        # pack folder into a .sigin archive to canonicalize
-        tmp_archive = os.path.join(tempfile.gettempdir(), f"plugin_{uuid.uuid4().hex}.sigin")
-        try:
-            with zipfile.ZipFile(tmp_archive, "w", zipfile.ZIP_DEFLATED) as z:
-                for root, dirs, files in os.walk(path):
-                    for fn in files:
-                        full = os.path.join(root, fn)
-                        rel = os.path.relpath(full, start=path)
-                        z.write(full, arcname=rel)
-            archive_path = tmp_archive
-        except Exception as e:
-            print("Failed to package folder:", e)
-            return
+    if not args:
+        _run_and_print([pwsh], interactive=True)
+        return
+    cmdstr = " ".join(args)
+    _run_and_print([pwsh, '-NoProfile', '-NonInteractive', '-Command', cmdstr])
+
+def cmd_cmd(args: List[str]):
+    if not args:
+        if os.name == 'nt':
+            _run_and_print(['cmd'], interactive=True)
+        else:
+            _run_and_print([os.environ.get('SHELL','/bin/sh')], interactive=True)
+        return
+    cmdstr = " ".join(args)
+    if os.name == 'nt':
+        _run_and_print(['cmd', '/c', cmdstr])
     else:
-        archive_path = path
-    # attempt to extract + register
-    try:
-        plugin_name, entry = _plugin_extract_and_register(archive_path)
-    except zipfile.BadZipFile:
-        print("Not a valid .sigin archive.")
+        _run_and_print([os.environ.get('SHELL','/bin/sh'), '-c', cmdstr])
+
+def cmd_sh(args: List[str]):
+    shell = os.environ.get('SHELL') or shutil.which('bash') or shutil.which('sh')
+    if not shell:
+        print("No POSIX shell found")
+        set_last(127)
         return
-    except Exception as e:
-        print("Install failed:", e)
+    if not args:
+        _run_and_print([shell], interactive=True)
         return
-
-    # run plugin-main.py in plugin extract folder (install-time hook)
-    try:
-        pm = os.path.join(entry["extract_dir"], "plugin-main.py")
-        if os.path.exists(pm):
-            # run plugin-main with run_name allowing it to perform install-time actions
-            runpy.run_path(pm, run_name=f"__sigil_plugin_install_{plugin_name}__")
-    except Exception as e:
-        print(f"Plugin-install hook error: {e}")
-
-    # load plugin commands
-    try:
-        _load_plugin_commands(plugin_name, entry)
-    except Exception:
-        pass
-
-    # save to registry
-    PLUGIN_REGISTRY[plugin_name] = entry
-    _save_registry()
-    print(f"Plugin installed: {plugin_name}")
-
-def uninstall_plugin(name: str):
-    """Uninstall plugin by name: remove commands, delete files."""
-    safe_name = _safe_plugin_name(name)
-    if safe_name not in PLUGIN_REGISTRY:
-        print("Plugin not found:", name)
-        return
-    entry = PLUGIN_REGISTRY[safe_name]
-    # remove commands that plugin registered
-    cmds = entry.get("commands", []) or []
-    for c in cmds:
-        if c in COMMANDS:
-            try:
-                del COMMANDS[c]
-            except Exception:
-                pass
-    # remove extracted folder
-    ex = entry.get("extract_dir")
-    try:
-        if ex and os.path.exists(ex):
-            shutil.rmtree(ex, ignore_errors=True)
-    except Exception:
-        pass
-    # remove archive
-    arch = entry.get("archive")
-    try:
-        if arch and os.path.exists(arch):
-            os.remove(arch)
-    except Exception:
-        pass
-    # remove from registry
-    del PLUGIN_REGISTRY[safe_name]
-    _save_registry()
-    print(f"Plugin removed: {safe_name}")
-
-def list_installed_plugins():
-    if not PLUGIN_REGISTRY:
-        print("No plugins installed.")
-        return
-    for name, entry in PLUGIN_REGISTRY.items():
-        info = entry.get("info") or {}
-        version = info.get("version", "")
-        desc = info.get("description", "")
-        print(f"- {name}" + (f" v{version}" if version else "") + (f" — {desc}" if desc else ""))
+    cmdstr = " ".join(args)
+    if os.path.basename(shell) == 'bash':
+        _run_and_print([shell, '-lc', cmdstr])
+    else:
+        _run_and_print([shell, '-c', cmdstr])
 
 # =============================
 # Commands implementations
@@ -666,6 +667,7 @@ def cmd_cpy(args: List[str]):
     dst = resolve(args[1])
     if not os.path.exists(src):
         print("Source does not exist")
+        set_last(1)
         return
     dst_existed = os.path.exists(dst)
     dst_backup = None
@@ -677,34 +679,41 @@ def cmd_cpy(args: List[str]):
     if os.path.isdir(src):
         if os.path.exists(dst):
             print("Destination exists (for directory copy) — operation aborted")
+            set_last(1)
             return
         shutil.copytree(src, dst)
     else:
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         shutil.copy2(src, dst)
     push_undo({"op": "cpy", "src": src, "dst": dst, "dst_existed": dst_existed, "dst_backup": dst_backup})
+    set_last(0)
     print("ok")
 
 def cmd_dlt(args: List[str]):
     if not args:
         print(HELP_TEXT["dlt"])
+        set_last(1)
         return
     path = resolve(args[0])
     if not os.path.exists(path):
         print("Path does not exist")
+        set_last(1)
         return
     backup = make_backup_of_path(path)
     push_undo({"op": "dlt", "path": path, "backup": backup})
+    set_last(0)
     print("ok")
 
 def cmd_move(args: List[str]):
     if len(args) < 3 or args[0] != "file":
         print(HELP_TEXT["move"])
+        set_last(1)
         return
     src = resolve(args[1])
     dst = resolve(args[2])
     if not os.path.exists(src):
         print("Source does not exist")
+        set_last(1)
         return
     dst_existed = os.path.exists(dst)
     dst_backup = None
@@ -716,6 +725,7 @@ def cmd_move(args: List[str]):
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
     shutil.move(src, dst)
     push_undo({"op": "move", "src": src, "dst": dst, "dst_existed": dst_existed, "dst_backup": dst_backup})
+    set_last(0)
     print("ok")
 
 def cmd_cd(args: List[str]):
@@ -743,6 +753,7 @@ def cmd_opnlnk(args: List[str]):
         print(HELP_TEXT["opnlnk"])
         return
     webbrowser.open(args[0])
+    set_last(0)
     print("ok")
 
 def cmd_opn(args: List[str]):
@@ -752,21 +763,29 @@ def cmd_opn(args: List[str]):
     path = resolve(args[0])
     if not os.path.exists(path):
         print("Path does not exist")
+        set_last(1)
         return
-    if os.name == "nt":
-        os.startfile(path)
-    elif sys.platform == "darwin":
-        subprocess.run(["open", path])
-    else:
-        subprocess.run(["xdg-open", path])
-    print("ok")
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path])
+        else:
+            subprocess.run(["xdg-open", path])
+        set_last(0)
+        print("ok")
+    except Exception as e:
+        print("Error opening:", e)
+        set_last(1)
 
 def cmd_ex(args: List[str]):
     if os.name == "nt":
         subprocess.Popen(["explorer", CURRENT_DIR])
+        set_last(0)
         print("ok")
     else:
         print("Explorer not supported on this OS")
+        set_last(1)
 
 def cmd_task(args: List[str]):
     try:
@@ -776,12 +795,15 @@ def cmd_task(args: List[str]):
         else:
             out = subprocess.check_output(["ps", "-e"]).decode(errors='ignore')
             print(out)
+        set_last(0)
     except Exception as e:
         print("Error listing tasks:", e)
+        set_last(1)
 
 def cmd_kill(args: List[str]):
     if len(args) < 2 or args[0] != "task":
         print(HELP_TEXT["kill"])
+        set_last(1)
         return
     name = args[1]
     try:
@@ -790,8 +812,10 @@ def cmd_kill(args: List[str]):
         else:
             subprocess.run(["pkill", name])
         print("ok")
+        set_last(0)
     except Exception as e:
         print("Error killing task:", e)
+        set_last(1)
 
 def cmd_say(args: List[str]):
     parts: List[str] = []
@@ -801,18 +825,22 @@ def cmd_say(args: List[str]):
         elif t in VARIABLES:
             parts.append(str(VARIABLES[t]))
         else:
+            # allow raw tokens to be printed (they may already have had interpolation)
             parts.append(t)
     print(" ".join(parts))
+    set_last(0)
 
 # Arithmetic & misc
 def cmd_add(args: List[str]):
     if not args:
         print("Usage: add <n1> <n2> [<n3> ...]")
+        set_last(1)
         return
     try:
         nums = _parse_numbers(args)
     except Exception as e:
         print("Error parsing numbers:", e)
+        set_last(1)
         return
     total = nums[0]
     for n in nums[1:]:
@@ -820,15 +848,18 @@ def cmd_add(args: List[str]):
     if isinstance(total, float) and total.is_integer():
         total = int(total)
     print(total)
+    set_last(0)
 
 def cmd_sub(args: List[str]):
     if not args or len(args) < 2:
         print("Usage: sub <n1> <n2> [<n3> ...]")
+        set_last(1)
         return
     try:
         nums = _parse_numbers(args)
     except Exception as e:
         print("Error parsing numbers:", e)
+        set_last(1)
         return
     result = nums[0]
     for n in nums[1:]:
@@ -836,15 +867,18 @@ def cmd_sub(args: List[str]):
     if isinstance(result, float) and result.is_integer():
         result = int(result)
     print(result)
+    set_last(0)
 
 def cmd_mul(args: List[str]):
     if not args:
         print("Usage: mul <n1> <n2> [<n3> ...]")
+        set_last(1)
         return
     try:
         nums = _parse_numbers(args)
     except Exception as e:
         print("Error parsing numbers:", e)
+        set_last(1)
         return
     prod = nums[0]
     for n in nums[1:]:
@@ -852,33 +886,40 @@ def cmd_mul(args: List[str]):
     if isinstance(prod, float) and prod.is_integer():
         prod = int(prod)
     print(prod)
+    set_last(0)
 
 def cmd_div(args: List[str]):
     if not args or len(args) < 2:
         print("Usage: div <n1> <n2> [<n3> ...]")
+        set_last(1)
         return
     try:
         nums = _parse_numbers(args)
     except Exception as e:
         print("Error parsing numbers:", e)
+        set_last(1)
         return
     result = float(nums[0])
     try:
         for n in nums[1:]:
             if n == 0:
                 print("Error: division by zero")
+                set_last(1)
                 return
             result /= n
     except Exception as e:
         print("Error during division:", e)
+        set_last(1)
         return
     if result.is_integer():
         result = int(result)
     print(result)
+    set_last(0)
 
 def cmd_clo(args: List[str]):
     if len(args) < 2 or args[0] != "task":
         print("Usage: clo task <name>")
+        set_last(1)
         return
     name = args[1]
     try:
@@ -887,8 +928,10 @@ def cmd_clo(args: List[str]):
         else:
             subprocess.run(["pkill", name])
         print("ok")
+        set_last(0)
     except Exception as e:
         print("Error closing task:", e)
+        set_last(1)
 
 def cmd_rstr(args: List[str]):
     if len(args) == 1 and args[0].lower() == "confirm":
@@ -897,15 +940,18 @@ def cmd_rstr(args: List[str]):
             time.sleep(2)
         except KeyboardInterrupt:
             print("Restart cancelled.")
+            set_last(1)
             return
         if os.name == "nt":
             subprocess.run(["shutdown", "/r", "/t", "0"])
         else:
             subprocess.run(["shutdown", "-r", "now"])
+        set_last(0)
     else:
         print("rstr is destructive. To confirm use: rstr confirm")
+        set_last(1)
 
-# Undo/redo helpers
+# Undo/redo helpers (kept from original)
 def perform_undo_action(action: dict):
     op = action.get("op")
     if op == "mk_dir":
@@ -1024,6 +1070,7 @@ def perform_redo_action(action: dict):
 def cmd_undo(args: List[str]):
     if not UNDO_STACK:
         print("Nothing to undo")
+        set_last(1)
         return
     action = UNDO_STACK.pop()
     inverse = perform_undo_action(action)
@@ -1031,11 +1078,13 @@ def cmd_undo(args: List[str]):
         REDO_STACK.append(inverse)
     else:
         REDO_STACK.append({"op": "noop"})
+    set_last(0)
     print("Undone.")
 
 def cmd_redo(args: List[str]):
     if not REDO_STACK:
         print("Nothing to redo")
+        set_last(1)
         return
     action = REDO_STACK.pop()
     inverse = perform_redo_action(action)
@@ -1043,11 +1092,13 @@ def cmd_redo(args: List[str]):
         UNDO_STACK.append(inverse)
     else:
         UNDO_STACK.append({"op": "noop"})
+    set_last(0)
     print("Redone.")
 
 def cmd_edt(args: List[str]):
     if not args:
         print(HELP_TEXT["edt"])
+        set_last(1)
         return
     path = resolve(args[0])
     existed = os.path.exists(path)
@@ -1060,11 +1111,12 @@ def cmd_edt(args: List[str]):
         editor = "notepad" if os.name == "nt" else "nano"
     try:
         subprocess.run([editor, path])
+        push_undo({"op": "edit", "path": path, "backup": backup})
+        set_last(0)
+        print("ok")
     except FileNotFoundError:
         print(f"Editor '{editor}' not found. Edit aborted.")
-        return
-    push_undo({"op": "edit", "path": path, "backup": backup})
-    print("ok")
+        set_last(1)
 
 def cmd_sdow(args: List[str]):
     if len(args) == 1 and args[0].lower() == "confirm":
@@ -1073,13 +1125,16 @@ def cmd_sdow(args: List[str]):
             time.sleep(2)
         except KeyboardInterrupt:
             print("Shutdown cancelled.")
+            set_last(1)
             return
         if os.name == "nt":
             subprocess.run(["shutdown", "/s", "/t", "0"])
         else:
             subprocess.run(["shutdown", "-h", "now"])
+        set_last(0)
     else:
         print("sdow is destructive. To confirm use: sdow confirm")
+        set_last(1)
 
 MOVIE_QUOTES = [
     "May the Force be with you.",
@@ -1149,48 +1204,61 @@ def cmd_bored(args: List[str]):
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             except Exception:
                 pass
+    set_last(0)
     print("Bored mode stopped.")
 
 # Aliases, variables, config management
 def cmd_alia(args: List[str]):
-    # list aliases if no args
     if not args:
         if not ALIASES:
             print("no aliases defined")
+            set_last(1)
             return
         for k, v in ALIASES.items():
             print(f"{k} -> {v}")
+        set_last(0)
         return
-    # create alias
     if len(args) >= 2:
         name = args[0]
         cmd_str = " ".join(args[1:])
         ALIASES[name] = cmd_str
         if not LOADING_RC:
             save_sigilrc()
+        set_last(0)
         print(f"Alias set: {name} -> {cmd_str}")
         return
     print("Usage: alia <name> <command>")
+    set_last(1)
 
 def cmd_unalia(args: List[str]):
     if not args:
         print("Usage: unalia <name>")
+        set_last(1)
         return
     name = args[0]
     if name in ALIASES:
         del ALIASES[name]
         if not LOADING_RC:
             save_sigilrc()
+        set_last(0)
         print(f"Alias removed: {name}")
     else:
         print("Alias not found")
+        set_last(1)
 
 def cmd_let(args: List[str]):
     if not args:
         print(HELP_TEXT["let"])
+        set_last(1)
         return
-    # let name = value  OR let name value
-    if len(args) >= 3 and args[1] == "=":
+    readonly = False
+    if args[0] == "-r":
+        readonly = True
+        args = args[1:]
+    if len(args) == 1:
+        name = args[0]
+        v = ""
+    elif len(args) >= 3 and args[1] == "=":
         name = args[0]
         val = " ".join(args[2:])
     elif len(args) >= 2:
@@ -1198,41 +1266,83 @@ def cmd_let(args: List[str]):
         val = " ".join(args[1:])
     else:
         print("Usage: let <name> = <value>")
+        set_last(1)
         return
-    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-        val = val[1:-1].replace('\\"', '"')
-    # try numeric cast
-    try:
-        if "." in val or "e" in val.lower():
-            v = float(val)
+    # support sugar: let x = ask "Prompt"
+    if 'v' not in locals():
+        toks = tokenize(val)
+        if toks and toks[0] == 'ask':
+            if len(toks) >= 2:
+                prompt_part = " ".join(toks[1:])
+                if len(prompt_part) >= 2 and prompt_part[0] == '"' and prompt_part[-1] == '"':
+                    prompt = prompt_part[1:-1]
+                else:
+                    prompt = expand_vars_in_string(prompt_part)
+            else:
+                prompt = ""
+            try:
+                entered = input(prompt + (" " if prompt else ""))
+            except EOFError:
+                entered = ""
+            v = entered
         else:
-            v = int(val)
-    except Exception:
-        v = val
+            if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                val = val[1:-1].replace('\\"', '"')
+                val = expand_vars_in_string(val)
+            else:
+                val = expand_vars_in_string(val)
+            try:
+                if isinstance(val, str) and ("." in val or "e" in val.lower()):
+                    v = float(val)
+                else:
+                    v = int(val)
+            except Exception:
+                v = val
+    if name in READONLY_VARS and not readonly:
+        print(f"Cannot overwrite readonly variable: {name}")
+        set_last(1)
+        return
     VARIABLES[name] = v
+    if readonly:
+        READONLY_VARS.add(name)
+    else:
+        READONLY_VARS.discard(name)
     if not LOADING_RC:
         save_sigilrc()
+    set_last(0)
     print(f"Set {name} = {v}")
 
 def cmd_var(args: List[str]):
     if not VARIABLES:
         print("no variables defined")
+        set_last(1)
         return
     for k, v in VARIABLES.items():
-        print(f"{k} = {v}")
+        ro = " (readonly)" if k in READONLY_VARS else ""
+        exp = " (exported)" if k in EXPORTED_VARS else ""
+        print(f"{k} = {v}{ro}{exp}")
+    set_last(0)
 
 def cmd_unset(args: List[str]):
     if not args:
         print("Usage: unset <name>")
+        set_last(1)
         return
     name = args[0]
     if name in VARIABLES:
+        if name in READONLY_VARS:
+            print("Cannot unset readonly variable")
+            set_last(1)
+            return
         del VARIABLES[name]
+        EXPORTED_VARS.discard(name)
         if not LOADING_RC:
             save_sigilrc()
         print(f"unset {name}")
+        set_last(0)
     else:
         print("variable not found")
+        set_last(1)
 
 def _eval_condition(tokens: List[str]) -> bool:
     if not tokens:
@@ -1248,7 +1358,6 @@ def _eval_condition(tokens: List[str]) -> bool:
             left = VARIABLES[left]
         if right in VARIABLES:
             right = VARIABLES[right]
-        # numeric?
         try:
             lnum = float(left)
             rnum = float(right)
@@ -1270,33 +1379,40 @@ def _eval_condition(tokens: List[str]) -> bool:
 def cmd_if(args: List[str]):
     if not args:
         print("Usage: if <cond> then <cmd>")
+        set_last(1)
         return
     try:
         then_i = args.index("then")
     except ValueError:
         print("Usage: if <cond> then <cmd>")
+        set_last(1)
         return
     cond_tokens = args[:then_i]
     cmd_tokens = args[then_i+1:]
     if _eval_condition(cond_tokens):
         run_lines([" ".join(cmd_tokens)])
+        set_last(0)
     else:
-        pass
+        set_last(1)
 
 def cmd_wait(args: List[str]):
     if not args:
         print("Usage: wait <seconds>")
+        set_last(1)
         return
     try:
         s = float(args[0])
     except Exception:
         print("Invalid number")
+        set_last(1)
         return
     time.sleep(s)
+    set_last(0)
 
 def cmd_renm(args: List[str]):
     if len(args) < 2:
         print("Usage: renm <old> <new>")
+        set_last(1)
         return
     cmd_move(["file", args[0], args[1]])
 
@@ -1314,22 +1430,27 @@ def _dir_size(path: str) -> int:
 def cmd_siz(args: List[str]):
     if not args:
         print("Usage: siz <file|dir>")
+        set_last(1)
         return
     path = resolve(args[0])
     if not os.path.exists(path):
         print("Not found")
+        set_last(1)
         return
     if os.path.isfile(path):
         print(os.path.getsize(path))
     else:
         print(_dir_size(path))
+    set_last(0)
 
 def cmd_pwd(args: List[str]):
     print(CURRENT_DIR)
+    set_last(0)
 
 def cmd_opnapp(args: List[str]):
     if not args:
         print("Usage: opnapp <name>")
+        set_last(1)
         return
     name = args[0]
     if os.path.exists(name):
@@ -1340,6 +1461,7 @@ def cmd_opnapp(args: List[str]):
         else:
             subprocess.Popen([name])
         print("ok")
+        set_last(0)
         return
     try:
         if os.name == "nt":
@@ -1349,31 +1471,48 @@ def cmd_opnapp(args: List[str]):
         else:
             subprocess.Popen([name])
         print("ok")
+        set_last(0)
     except Exception as e:
         print("Failed to launch:", e)
+        set_last(1)
 
 def cmd_run(args: List[str]):
     if not args:
         print("Usage: run <file.sig>")
+        set_last(1)
         return
     path = resolve(args[0])
     if not os.path.exists(path):
         print("File not found")
+        set_last(1)
         return
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        run_lines(lines)
+        # when running a script via run, set script context locally
+        prev_file = SCRIPT_FILE
+        prev_dir = SCRIPT_DIR
+        prev_args = SCRIPT_ARGS[:]
+        try:
+            run_lines(lines)
+        finally:
+            # restore
+            SCRIPT_FILE = prev_file
+            SCRIPT_DIR = prev_dir
+            SCRIPT_ARGS = prev_args
     except Exception as e:
         print("Error running script:", e)
+        set_last(1)
 
 def cmd_inc(args: List[str]):
     if not args:
         print("Usage: inc <file.sig>")
+        set_last(1)
         return
     path = resolve(args[0])
     if not os.path.exists(path):
         print("File not found")
+        set_last(1)
         return
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1381,14 +1520,17 @@ def cmd_inc(args: List[str]):
         run_lines(lines)
     except Exception as e:
         print("Error including file:", e)
+        set_last(1)
 
 def cmd_fmt(args: List[str]):
     if not args:
         print("Usage: fmt <file.sig>")
+        set_last(1)
         return
     path = resolve(args[0])
     if not os.path.exists(path):
         print("File not found")
+        set_last(1)
         return
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1398,16 +1540,20 @@ def cmd_fmt(args: List[str]):
         with open(path, "w", encoding="utf-8") as f:
             f.write(out_text)
         print("Formatted:", path)
+        set_last(0)
     except Exception as e:
         print("Format failed:", e)
+        set_last(1)
 
 def cmd_schk(args: List[str]):
     if not args:
         print("Usage: schk <file.sig>")
+        set_last(1)
         return
     path = resolve(args[0])
     if not os.path.exists(path):
         print("File not found")
+        set_last(1)
         return
     problems = []
     try:
@@ -1429,15 +1575,17 @@ def cmd_schk(args: List[str]):
             print("Syntax check found problems:")
             for ln, msg in problems:
                 print(f"  Line {ln}: {msg}")
+            set_last(1)
         else:
             print("No syntax problems found.")
+            set_last(0)
     except Exception as e:
         print("Check failed:", e)
+        set_last(1)
 
 # Profiles (prof), reload/save config commands
 def cmd_prof(args: List[str]):
     global CURRENT_PROFILE, ALIASES, VARIABLES
-    # list profiles
     if not args:
         profiles = ["default"]
         try:
@@ -1448,35 +1596,38 @@ def cmd_prof(args: List[str]):
             pass
         for p in sorted(set(profiles)):
             print(p)
+        set_last(0)
         return
-    # show
     if args[0] == "show":
         print(f"current profile: {CURRENT_PROFILE}")
+        set_last(0)
         return
-    # new
     if args[0] == "new" and len(args) == 2:
         name = args[1]
         path = rc_path(name)
         if os.path.exists(path):
             print("profile already exists")
+            set_last(1)
             return
         open(path, "w", encoding="utf-8").close()
         print(f"created profile: {name}")
+        set_last(0)
         return
-    # delete
     if args[0] == "del" and len(args) == 2:
         name = args[1]
         if name == "default":
             print("cannot delete default profile")
+            set_last(1)
             return
         path = rc_path(name)
         if not os.path.exists(path):
             print("profile not found")
+            set_last(1)
             return
         os.remove(path)
         print(f"deleted profile: {name}")
+        set_last(0)
         return
-    # switch
     name = args[0]
     CURRENT_PROFILE = name
     ALIASES.clear()
@@ -1486,24 +1637,20 @@ def cmd_prof(args: List[str]):
         open(path, "w", encoding="utf-8").close()
     load_sigilrc()
     print(f"profile switched to: {name}")
+    set_last(0)
 
 def cmd_rrc(args: List[str]):
     load_sigilrc()
     print(f"{os.path.basename(rc_path())} reloaded")
+    set_last(0)
 
 def cmd_svrc(args: List[str]):
     save_sigilrc()
     print(f"config saved ({os.path.basename(rc_path())})")
+    set_last(0)
 
 # NEW: pause command (pse)
 def cmd_pse(args: List[str]):
-    """
-    pse [message]
-    Pause so the user can inspect output.
-    - If a message is provided it'll be printed before waiting.
-    - On Windows: waits for any keypress (msvcrt.getch).
-    - On other OSes: prompts and waits for Enter.
-    """
     msg = ""
     if args:
         joined = " ".join(args)
@@ -1513,45 +1660,245 @@ def cmd_pse(args: List[str]):
             msg = joined
     try:
         if msg:
-            # print message without extra newline if it already ends with one
             if msg.endswith("\n"):
                 print(msg, end="", flush=True)
             else:
                 print(msg, end="", flush=True)
         if msvcrt:
-            # Windows: any key
             print(" (press any key to continue)", end="", flush=True)
             msvcrt.getch()
-            print("")  # newline
+            print("")
         else:
             input(" (press Enter to continue)")
+        set_last(0)
     except Exception:
         time.sleep(1)
+        set_last(1)
+
+# Plugin command wrappers
+def install_plugin_from_path(path: str):
+    if not os.path.exists(path):
+        print("Plugin archive not found:", path)
+        return
+    if os.path.isdir(path):
+        tmp_archive = os.path.join(tempfile.gettempdir(), f"plugin_{uuid.uuid4().hex}.sigin")
+        try:
+            with zipfile.ZipFile(tmp_archive, "w", zipfile.ZIP_DEFLATED) as z:
+                for root, dirs, files in os.walk(path):
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        rel = os.path.relpath(full, start=path)
+                        z.write(full, arcname=rel)
+            archive_path = tmp_archive
+        except Exception as e:
+            print("Failed to package folder:", e)
+            return
+    else:
+        archive_path = path
+    try:
+        plugin_name, entry = _plugin_extract_and_register(archive_path)
+    except zipfile.BadZipFile:
+        print("Not a valid .sigin archive.")
+        return
+    except Exception as e:
+        print("Install failed:", e)
+        return
+    try:
+        pm = os.path.join(entry["extract_dir"], "plugin-main.py")
+        if os.path.exists(pm):
+            runpy.run_path(pm, run_name=f"__sigil_plugin_install_{plugin_name}__")
+    except Exception as e:
+        print(f"Plugin-install hook error: {e}")
+    try:
+        _load_plugin_commands(plugin_name, entry)
+    except Exception:
+        pass
+    PLUGIN_REGISTRY[plugin_name] = entry
+    _save_registry()
+    print(f"Plugin installed: {plugin_name}")
+
+def uninstall_plugin(name: str):
+    safe_name = _safe_plugin_name(name)
+    if safe_name not in PLUGIN_REGISTRY:
+        print("Plugin not found:", name)
+        return
+    entry = PLUGIN_REGISTRY[safe_name]
+    cmds = entry.get("commands", []) or []
+    for c in cmds:
+        if c in COMMANDS:
+            try:
+                del COMMANDS[c]
+            except Exception:
+                pass
+    ex = entry.get("extract_dir")
+    try:
+        if ex and os.path.exists(ex):
+            shutil.rmtree(ex, ignore_errors=True)
+    except Exception:
+        pass
+    arch = entry.get("archive")
+    try:
+        if arch and os.path.exists(arch):
+            os.remove(arch)
+    except Exception:
+        pass
+    del PLUGIN_REGISTRY[safe_name]
+    _save_registry()
+    print(f"Plugin removed: {safe_name}")
+
+def list_installed_plugins():
+    if not PLUGIN_REGISTRY:
+        print("No plugins installed.")
+        return
+    for name, entry in PLUGIN_REGISTRY.items():
+        info = entry.get("info") or {}
+        version = info.get("version", "")
+        desc = info.get("description", "")
+        print(f"- {name}" + (f" v{version}" if version else "") + (f" — {desc}" if desc else ""))
 
 # =============================
-# Plugin command wrappers
+# Exit / last handling
 # =============================
+def set_last(code: int):
+    try:
+        icode = int(code)
+    except Exception:
+        icode = 1
+    VARIABLES['last'] = icode
+    VARIABLES['LAST'] = icode
+    VARIABLES['LAST_EXIT'] = icode
+
+# =============================
+# Control primitives: ask, exit, rpt, exists, arg
+# =============================
+def cmd_ask(args: List[str]):
+    if not args:
+        print("Usage: ask <name> [prompt]  OR  ask = <name>")
+        set_last(1)
+        return
+    if args[0] == "=":
+        if len(args) < 2:
+            print("Usage: ask = <name>")
+            set_last(1)
+            return
+        name = args[1]
+        prompt = ""
+    else:
+        name = args[0]
+        prompt = " ".join(args[1:]) if len(args) > 1 else ""
+        if len(prompt) >= 2 and prompt[0] == '"' and prompt[-1] == '"':
+            prompt = prompt[1:-1]
+    try:
+        val = input(prompt + (" " if prompt else ""))
+    except EOFError:
+        val = ""
+    VARIABLES[name] = val
+    set_last(0)
+
+def cmd_exit(args: List[str]):
+    code = 0
+    if args:
+        try:
+            code = int(args[0])
+        except Exception:
+            code = 1
+    set_last(code)
+    raise SystemExit(code)
+
+def cmd_rpt(args: List[str]):
+    if not args:
+        print("Usage: rpt <count|inf> <command...>  or rpt <count|inf> (with endrpt block)")
+        set_last(1)
+        return
+    count = args[0]
+    if len(args) >= 2:
+        cmdline = " ".join(args[1:])
+        try:
+            if str(count).lower() in ('inf', 'infinite', 'forever'):
+                while True:
+                    try:
+                        run_lines([cmdline])
+                    except KeyboardInterrupt:
+                        break
+            else:
+                n = int(count)
+                for _ in range(n):
+                    run_lines([cmdline])
+            set_last(0)
+        except KeyboardInterrupt:
+            set_last(0)
+        except Exception as e:
+            print("rpt error:", e)
+            set_last(1)
+    else:
+        set_last(0)
+
+def cmd_exists(args: List[str]):
+    if not args:
+        print(HELP_TEXT.get("exists", "exists <path>"))
+        set_last(1)
+        return
+    path = resolve(args[0])
+    if os.path.exists(path):
+        print("yes")
+        set_last(0)
+    else:
+        print("no")
+        set_last(1)
+
+def cmd_arg(args: List[str]):
+    if not args:
+        print(HELP_TEXT.get("arg", "arg <n> | arg count"))
+        set_last(1)
+        return
+    if args[0].lower() == 'count':
+        print(len(SCRIPT_ARGS))
+        set_last(0)
+        return
+    try:
+        idx = int(args[0])
+    except Exception:
+        print("Invalid argument index")
+        set_last(1)
+        return
+    if 1 <= idx <= len(SCRIPT_ARGS):
+        print(SCRIPT_ARGS[idx-1])
+        set_last(0)
+    else:
+        print("")
+        set_last(1)
+
+# simple export command (map sigil var to OS env)
+def cmd_export(args: List[str]):
+    if not args:
+        print("Usage: export NAME [NAME2 ...]")
+        set_last(1)
+        return
+    for name in args:
+        if name in VARIABLES:
+            v = str(VARIABLES[name])
+            os.environ[name] = v
+            EXPORTED_VARS.add(name)
+        else:
+            print(f"variable not found: {name}")
+    save_sigilrc()
+    set_last(0)
+
+# plugin wrapper commands
 def cmd_pin(args: List[str]):
-    """
-    pin <path-to-plugin.sigin>  -> install plugin from archive or folder
-    pin                         -> list installed plugins
-    """
     if not args:
         list_installed_plugins()
         return
     path = args[0]
-    # allow ~ expansion
     path = os.path.expanduser(path)
     if not os.path.isabs(path):
         path = resolve(path)
     install_plugin_from_path(path)
 
 def cmd_prv(args: List[str]):
-    """
-    prv <plugin-name> -> Remove/uninstall plugin
-    """
     if not args:
         print(HELP_TEXT["prv"])
+        set_last(1)
         return
     name = args[0]
     uninstall_plugin(name)
@@ -1589,6 +1936,16 @@ COMMANDS = {
     "let": cmd_let,
     "var": cmd_var,
     "unset": cmd_unset,
+    "export": cmd_export,
+    "ps": cmd_ps,
+    "cmd": cmd_cmd,
+    "cp": cmd_cmd,
+    "sh": cmd_sh,
+    "exists": cmd_exists,
+    "arg": cmd_arg,
+    "rpt": cmd_rpt,
+    "ask": cmd_ask,
+    "exit": cmd_exit,
     "if": cmd_if,
     "wait": cmd_wait,
     "sleep": cmd_wait,
@@ -1613,14 +1970,12 @@ COMMANDS = {
 }
 
 # =============================
-# Interpreter
+# Interpreter: execute_line & run_lines
 # =============================
 def execute_line(line: str, from_rc: bool = False):
-    # strip comments first
     stripped, _ = strip_comments_from_line(line, False)
     if not stripped:
         return
-    # expand aliases and variables
     expanded = expand_aliases_and_vars(stripped)
     parts = tokenize(expanded)
     if not parts:
@@ -1629,46 +1984,89 @@ def execute_line(line: str, from_rc: bool = False):
     args = parts[1:]
     if cmd in COMMANDS:
         try:
-            COMMANDS[cmd](args)
+            res = COMMANDS[cmd](args)
+            if isinstance(res, int):
+                set_last(res)
+            else:
+                if 'last' not in VARIABLES and 'LAST' not in VARIABLES and 'LAST_EXIT' not in VARIABLES:
+                    set_last(0)
+        except SystemExit as se:
+            code = getattr(se, 'code', 0)
+            set_last(code if code is not None else 0)
+            raise
         except Exception as e:
             print(f"Error executing {cmd}: {e}")
+            set_last(1)
     else:
-        # maybe alias exists untreated
         if cmd in ALIASES:
             new_line = ALIASES[cmd] + (" " + " ".join(args) if args else "")
             execute_line(new_line, from_rc=from_rc)
         else:
             print(f"Unknown glyph: {cmd} (try 'help')")
+            set_last(1)
 
 def run_lines(lines: List[str], from_rc: bool = False):
-    """Run a list of lines. Handles block comments across lines."""
+    """Run a list of lines. Handles block comments across lines and 'rpt' block form."""
     in_block = False
-    for raw in lines:
-        line = raw.rstrip("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i].rstrip("\n")
         if in_block:
-            # check for end of block inside this line
-            end_idx = line.find("*/")
+            end_idx = raw.find("*/")
             if end_idx == -1:
-                # still in block
+                i += 1
                 continue
             else:
-                line = line[end_idx+2:]
+                raw = raw[end_idx+2:]
                 in_block = False
-        # strip comments (this returns state but we handle block manually)
-        stripped, enters_block = strip_comments_from_line(line, False)
+        stripped, enters_block = strip_comments_from_line(raw, False)
         if enters_block:
-            # a '/*' started and not closed on same line; mark and continue
-            # we still process the part before the block (strip_comments_from_line removed block)
             in_block = True
         if not stripped:
+            i += 1
+            continue
+        parts = tokenize(stripped)
+        if parts and parts[0] == 'rpt':
+            if len(parts) >= 3:
+                execute_line(stripped, from_rc=from_rc)
+                i += 1
+                continue
+            count = parts[1] if len(parts) >= 2 else 'inf'
+            block_lines = []
+            j = i + 1
+            while j < len(lines):
+                raw2 = lines[j].rstrip("\n")
+                s2, _ = strip_comments_from_line(raw2, False)
+                if s2 and s2.strip() == 'endrpt':
+                    break
+                block_lines.append(lines[j])
+                j += 1
+            if j >= len(lines):
+                print("rpt block not closed (missing 'endrpt')")
+                set_last(1)
+                return
+            try:
+                if str(count).lower() in ('inf', 'infinite', 'forever'):
+                    while True:
+                        try:
+                            run_lines(block_lines, from_rc=from_rc)
+                        except KeyboardInterrupt:
+                            break
+                else:
+                    n = int(count)
+                    for _ in range(n):
+                        run_lines(block_lines, from_rc=from_rc)
+            except KeyboardInterrupt:
+                pass
+            i = j + 1
             continue
         execute_line(stripped, from_rc=from_rc)
+        i += 1
 
 # =============================
 # Utilities
 # =============================
 def resolve(path: str) -> str:
-    # Support absolute paths as-is
     if os.path.isabs(path):
         return os.path.abspath(path)
     return os.path.abspath(os.path.join(CURRENT_DIR, path))
@@ -1677,22 +2075,30 @@ def resolve(path: str) -> str:
 # REPL / entrypoint
 # =============================
 def main():
-    # load plugin registry and load plugins before rc so plugin commands are available in rc
+    global SCRIPT_FILE, SCRIPT_DIR, SCRIPT_ARGS, CURRENT_DIR
     load_plugins_on_startup()
-
-    # initial load of rc (from SIGIL_CONFIG_DIR)
     load_sigilrc()
+    # initialize script-related variables for interactive sessions
+    SCRIPT_FILE = ""
+    SCRIPT_DIR = ""
+    SCRIPT_ARGS = []
+    VARIABLES['script.dir'] = SCRIPT_DIR
+    VARIABLES['script.file'] = SCRIPT_FILE
     # handle file execution
     if len(sys.argv) > 1 and sys.argv[1].strip():
         script = sys.argv[1].strip()
         if not os.path.exists(script):
             print(f"File not found: {script}")
             return
+        SCRIPT_FILE = os.path.abspath(script)
+        SCRIPT_DIR = os.path.dirname(SCRIPT_FILE)
+        SCRIPT_ARGS = sys.argv[2:]
+        VARIABLES['script.dir'] = SCRIPT_DIR
+        VARIABLES['script.file'] = SCRIPT_FILE
         with open(script, "r", encoding="utf-8") as f:
             file_lines = f.readlines()
         run_lines(file_lines)
         return
-    # interactive REPL
     print("🔮 Sigil REPL — type 'help' for glyphs, 'exit' to leave")
     while True:
         try:
