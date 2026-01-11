@@ -1,1 +1,2319 @@
+#!/usr/bin/env python3
+"""
+Sigil — Single-File Shell Engine (Polished Edition)
 
+A feature-rich scripting shell with:
+- Persistent profiles with aliases/variables
+- Control flow: if/case/rpt/goto/labels
+- File operations with undo support
+- Graphical prompts and JSON manipulation
+- Plugin system
+- Cross-platform compatibility
+
+Version: 2.0
+License: NOT MIT
+"""
+
+from __future__ import annotations
+import sys
+import os
+import shutil
+import subprocess
+import tempfile
+import uuid
+import time
+import random
+import webbrowser
+import zipfile
+import json
+import re
+from typing import List, Tuple, Any, Dict, Optional
+from pathlib import Path
+
+# ============================================================================
+# PLATFORM DETECTION & IMPORTS
+# ============================================================================
+
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    msvcrt = None
+    HAS_MSVCRT = False
+
+try:
+    import select
+    import termios
+    import tty
+    HAS_UNIX_TERM = True
+except ImportError:
+    select = None
+    termios = None
+    tty = None
+    HAS_UNIX_TERM = False
+
+# ============================================================================
+# CONFIGURATION & GLOBALS
+# ============================================================================
+
+class Config:
+    """Central configuration"""
+    VERSION = "2.0"
+    UNDO_LIMIT = 200
+    ALIAS_RECURSION_LIMIT = 20
+
+    if os.name == "nt":
+        CONFIG_DIR = Path(r"C:\Sigil")
+    else:
+        CONFIG_DIR = Path.home() / ".sigil"
+
+    @classmethod
+    def init_directories(cls):
+        """Initialize all required directories"""
+        cls.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        cls.PLUGIN_DIR = cls.CONFIG_DIR / "plugins"
+        cls.PLUGIN_DIR.mkdir(exist_ok=True)
+        cls.UNDO_DIR = Path(tempfile.gettempdir()) / "sigil_undo"
+        cls.UNDO_DIR.mkdir(exist_ok=True)
+
+Config.init_directories()
+
+class State:
+    """Application state management"""
+    current_profile: str = "default"
+    current_dir: Path = Path.cwd()
+
+    script_file: str = ""
+    script_dir: str = ""
+    script_args: List[str] = []
+
+    aliases: Dict[str, str] = {}
+    variables: Dict[str, Any] = {}
+    exported_vars: set = set()
+    readonly_vars: set = set()
+
+    undo_stack: List[dict] = []
+    redo_stack: List[dict] = []
+
+    loading_rc: bool = False
+    plugin_registry: dict = {}
+
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class BreakException(Exception):
+    """Signal break from loop/case block"""
+    pass
+
+class SigilError(Exception):
+    """Base exception for Sigil errors"""
+    pass
+
+class CommandError(SigilError):
+    """Error executing command"""
+    pass
+
+# ============================================================================
+# PERSISTENCE (RC FILES)
+# ============================================================================
+
+class RCManager:
+    """Manage .sigilrc profile files"""
+
+    @staticmethod
+    def get_rc_path(profile: Optional[str] = None) -> Path:
+        """Get path to profile's RC file"""
+        name = profile or State.current_profile
+        if name == "default":
+            return Config.CONFIG_DIR / ".sigilrc"
+        return Config.CONFIG_DIR / f".sigilrc.{name}"
+
+    @staticmethod
+    def save() -> None:
+        """Save current state to RC file"""
+        path = RCManager.get_rc_path()
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# Sigil RC — Profile: {State.current_profile}\n")
+                f.write(f"# Version: {Config.VERSION}\n\n")
+
+                # Save aliases
+                if State.aliases:
+                    f.write("# Aliases\n")
+                    for name, cmd in sorted(State.aliases.items()):
+                        f.write(f"alia {name} {cmd}\n")
+                    f.write("\n")
+
+                # Save variables
+                if State.variables:
+                    f.write("# Variables\n")
+                    for name, value in sorted(State.variables.items()):
+                        if isinstance(value, str):
+                            needs_quote = any(ch.isspace() for ch in value) or value == ""
+                            escaped = value.replace('"', '\\"')
+                            readonly_flag = "-r " if name in State.readonly_vars else ""
+
+                            if needs_quote:
+                                f.write(f'let {readonly_flag}{name} = "{escaped}"\n')
+                            else:
+                                f.write(f"let {readonly_flag}{name} = {escaped}\n")
+                        else:
+                            readonly_flag = "-r " if name in State.readonly_vars else ""
+                            f.write(f"let {readonly_flag}{name} = {value}\n")
+                    f.write("\n")
+
+                # Save exports
+                if State.exported_vars:
+                    f.write("# Exports\n")
+                    for name in sorted(State.exported_vars):
+                        f.write(f"export {name}\n")
+
+        except Exception as e:
+            print(f"⚠ Failed to save .sigilrc: {e}")
+
+    @staticmethod
+    def load() -> None:
+        """Load RC file for current profile"""
+        path = RCManager.get_rc_path()
+
+        if not path.exists():
+            return
+
+        State.loading_rc = True
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            Interpreter.run_lines(lines, from_rc=True)
+        except Exception as e:
+            print(f"⚠ Error loading .sigilrc: {e}")
+        finally:
+            State.loading_rc = False
+
+# ============================================================================
+# UNDO/BACKUP SYSTEM
+# ============================================================================
+class UndoManager:
+    """Manage undo/redo operations"""
+
+    @staticmethod
+    def backup_path(path: Path) -> Optional[Path]:
+        """Create backup of path (move to temp), return backup location"""
+        if not path.exists():
+            return None
+
+        backup_id = str(uuid.uuid4())
+        backup_dir = Config.UNDO_DIR / backup_id
+        backup_dir.mkdir(exist_ok=True)
+
+        dest = backup_dir / path.name
+        shutil.move(str(path), str(dest))
+        return dest
+
+    @staticmethod
+    def backup_contents(path: Path) -> Optional[Path]:
+        """Create backup of file contents (copy), return backup location"""
+        if not path.exists() or path.is_dir():
+            return None
+
+        backup_id = str(uuid.uuid4())
+        backup_path = Config.UNDO_DIR / f"{backup_id}_{path.name}"
+        shutil.copy2(str(path), str(backup_path))
+        return backup_path
+
+    @staticmethod
+    def push(action: dict) -> None:
+        """Push action onto undo stack"""
+        State.undo_stack.append(action)
+        if len(State.undo_stack) > Config.UNDO_LIMIT:
+            State.undo_stack.pop(0)
+        State.redo_stack.clear()
+
+    @staticmethod
+    def safe_move(src: Path, dst: Path) -> None:
+        """Safely move file, creating parent directories"""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+
+# ============================================================================
+# TEXT PROCESSING
+# ============================================================================
+
+class TextProcessor:
+    """Handle tokenization, comment stripping, variable expansion"""
+
+    _varname_re = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+    @staticmethod
+    def tokenize(line: str) -> List[str]:
+        """Split line into tokens, respecting quotes"""
+        tokens = []
+        current = ""
+        in_quotes = False
+
+        for char in line:
+            if char == '"':
+                in_quotes = not in_quotes
+                current += char
+            elif not in_quotes and char.isspace():
+                if current:
+                    tokens.append(current)
+                    current = ""
+            else:
+                current += char
+
+        if current:
+            tokens.append(current)
+
+        return tokens
+
+    @staticmethod
+    def strip_comments(line: str, in_block_comment: bool) -> Tuple[str, bool]:
+        """Strip comments from line, handle block comments"""
+        # Handle existing block comment
+        if in_block_comment:
+            end_idx = line.find("*/")
+            if end_idx == -1:
+                return "", True
+            line = line[end_idx + 2:]
+            in_block_comment = False
+
+        # Handle new block comments
+        while True:
+            start_idx = line.find("/*")
+            if start_idx == -1:
+                break
+
+            end_idx = line.find("*/", start_idx + 2)
+            if end_idx == -1:
+                line = line[:start_idx]
+                in_block_comment = True
+                break
+            else:
+                line = line[:start_idx] + line[end_idx + 2:]
+
+        # Check for line comment markers
+        stripped = line.lstrip()
+        if stripped.startswith('&'):
+            return "", in_block_comment
+
+        # Process character by character for inline comments
+        result = []
+        in_quotes = False
+        i = 0
+
+        while i < len(line):
+            char = line[i]
+
+            if char == '"':
+                in_quotes = not in_quotes
+                result.append(char)
+                i += 1
+                continue
+
+            if not in_quotes:
+                # Check for comment markers
+                if char in ('&', '#'):
+                    break
+                if char == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                    break
+
+            result.append(char)
+            i += 1
+
+        return "".join(result).rstrip(), in_block_comment
+
+    @staticmethod
+    def expand_vars_in_string(text: str) -> str:
+        """Expand $var and ${var} in string.
+
+        Preserve regular backslashes (so Windows paths like C:\\Users\\... keep their backslashes).
+        Treat backslash as an escape only for $, {, }, '"' and backslash itself.
+        """
+        result = []
+        i = 0
+        length = len(text)
+
+        while i < length:
+            char = text[i]
+
+            # Handle backslash escapes for a small safe set
+            if char == '\\':
+                if i + 1 < length:
+                    nxt = text[i + 1]
+                    # Only consume the backslash when escaping one of these characters
+                    if nxt in ('$', '{', '}', '"', '\\'):
+                        result.append(nxt)
+                        i += 2
+                        continue
+                    else:
+                        # keep the backslash as a literal and keep the next char too
+                        result.append('\\')
+                        i += 1
+                        continue
+                else:
+                    # trailing backslash - keep it
+                    result.append('\\')
+                    i += 1
+                    continue
+
+            # Handle variable expansion
+            if char == '$':
+                # ${var} form
+                if i + 1 < length and text[i + 1] == '{':
+                    end_idx = text.find('}', i + 2)
+                    if end_idx != -1:
+                        var_name = text[i + 2:end_idx]
+                        value = State.variables.get(var_name, os.environ.get(var_name, ""))
+                        result.append(str(value))
+                        i = end_idx + 1
+                        continue
+
+                # $var form
+                match = TextProcessor._varname_re.match(text[i + 1:])
+                if match:
+                    var_name = match.group(0)
+                    value = State.variables.get(var_name, os.environ.get(var_name, ""))
+                    result.append(str(value))
+                    i += 1 + len(var_name)
+                    continue
+
+            result.append(char)
+            i += 1
+
+        return "".join(result)
+
+    @staticmethod
+    def expand_aliases_and_vars(line: str) -> str:
+        """Expand aliases and variables in command line"""
+        tokens = TextProcessor.tokenize(line)
+        if not tokens:
+            return line
+
+        # Expand aliases recursively (with depth limit)
+        first = tokens[0]
+        if first in State.aliases:
+            new_line = State.aliases[first]
+            if len(tokens) > 1:
+                new_line += " " + " ".join(tokens[1:])
+
+            # Recursive expansion with depth limit
+            for _ in range(Config.ALIAS_RECURSION_LIMIT):
+                new_tokens = TextProcessor.tokenize(new_line)
+                if new_tokens and new_tokens[0] in State.aliases:
+                    rest = " " + " ".join(new_tokens[1:]) if len(new_tokens) > 1 else ""
+                    new_line = State.aliases[new_tokens[0]] + rest
+                else:
+                    break
+
+            return TextProcessor.expand_aliases_and_vars(new_line)
+
+        # Expand variables in tokens
+        expanded_tokens = []
+        for token in tokens:
+            # Single-quote shorthand: 'varname' -> value
+            if len(token) >= 2 and token[0] == "'" and token[-1] == "'":
+                inner = token[1:-1]
+                value = State.variables.get(inner, os.environ.get(inner, inner))
+                expanded_tokens.append(str(value))
+                continue
+
+            # Double-quoted string: expand vars inside
+            if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+                inner = token[1:-1]
+                expanded = TextProcessor.expand_vars_in_string(inner)
+                expanded_tokens.append('"' + expanded.replace('"', '\\"') + '"')
+                continue
+
+            # Token with $ in it
+            if '$' in token:
+                expanded_tokens.append(TextProcessor.expand_vars_in_string(token))
+                continue
+
+            # Direct variable reference
+            if token in State.variables:
+                expanded_tokens.append(str(State.variables[token]))
+                continue
+
+            expanded_tokens.append(token)
+
+        return " ".join(expanded_tokens)
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def resolve_path(path_str: str) -> Path:
+    """Resolve path with variable expansion and relative to CWD"""
+    expanded = TextProcessor.expand_vars_in_string(path_str)
+    path = Path(expanded).expanduser()
+
+    if not path.is_absolute():
+        path = State.current_dir / path
+
+    return path.resolve()
+
+def set_last_exit(code: int) -> None:
+    """Set last exit code variables"""
+    try:
+        int_code = int(code)
+    except (ValueError, TypeError):
+        int_code = 1
+
+    State.variables['last'] = int_code
+    State.variables['LAST'] = int_code
+    State.variables['LAST_EXIT'] = int_code
+
+def parse_number(text: str) -> float | int:
+    """Parse numeric value from string"""
+    if text in State.variables:
+        text = str(State.variables[text])
+
+    if isinstance(text, (int, float)):
+        return text
+
+    # Remove quotes if present
+    if isinstance(text, str) and len(text) >= 2:
+        if text[0] == '"' and text[-1] == '"':
+            text = text[1:-1]
+
+    # Try parsing
+    try:
+        if "." in str(text) or "e" in str(text).lower():
+            return float(text)
+        return int(text)
+    except (ValueError, TypeError):
+        return 0
+
+def parse_numbers(args: List[str]) -> List[float | int]:
+    """Parse list of numbers"""
+    return [parse_number(arg) for arg in args]
+
+# ============================================================================
+# SHELL INTEGRATION
+# ============================================================================
+
+class ShellRunner:
+    """Run external shell commands"""
+
+    @staticmethod
+    def run_and_print(cmd_list: List[str], interactive: bool = False) -> int:
+        """Run command and print output, return exit code"""
+        try:
+            if interactive:
+                result = subprocess.run(cmd_list)
+                rc = result.returncode if hasattr(result, 'returncode') else 0
+            else:
+                result = subprocess.run(
+                    cmd_list,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                if result.stdout:
+                    print(result.stdout, end='')
+                if result.stderr:
+                    print(result.stderr, end='', flush=True)
+                rc = result.returncode
+
+        except FileNotFoundError:
+            print(f"⚠ Shell not found: {cmd_list[0]}")
+            rc = 127
+        except Exception as e:
+            print(f"⚠ Error running subprocess: {e}")
+            rc = 1
+
+        set_last_exit(rc)
+        return rc
+
+    @staticmethod
+    def powershell(args: List[str]) -> None:
+        """Run PowerShell command"""
+        pwsh = shutil.which('pwsh') or shutil.which('powershell')
+        if not pwsh:
+            print("⚠ PowerShell not found on PATH")
+            set_last_exit(127)
+            return
+
+        if not args:
+            ShellRunner.run_and_print([pwsh], interactive=True)
+        else:
+            cmd_str = " ".join(args)
+            ShellRunner.run_and_print([pwsh, '-NoProfile', '-NonInteractive', '-Command', cmd_str])
+
+    @staticmethod
+    def cmd(args: List[str]) -> None:
+        """Run cmd.exe or system shell command"""
+        if not args:
+            if os.name == 'nt':
+                ShellRunner.run_and_print(['cmd'], interactive=True)
+            else:
+                shell = os.environ.get('SHELL', '/bin/sh')
+                ShellRunner.run_and_print([shell], interactive=True)
+            return
+
+        cmd_str = " ".join(args)
+        if os.name == 'nt':
+            ShellRunner.run_and_print(['cmd', '/c', cmd_str])
+        else:
+            shell = os.environ.get('SHELL', '/bin/sh')
+            ShellRunner.run_and_print([shell, '-c', cmd_str])
+
+    @staticmethod
+    def sh(args: List[str]) -> None:
+        """Run POSIX shell command"""
+        shell = os.environ.get('SHELL') or shutil.which('bash') or shutil.which('sh')
+        if not shell:
+            print("⚠ No POSIX shell found")
+            set_last_exit(127)
+            return
+
+        if not args:
+            ShellRunner.run_and_print([shell], interactive=True)
+        else:
+            cmd_str = " ".join(args)
+            if 'bash' in os.path.basename(shell):
+                ShellRunner.run_and_print([shell, '-lc', cmd_str])
+            else:
+                ShellRunner.run_and_print([shell, '-c', cmd_str])
+
+# ============================================================================
+# COMMAND IMPLEMENTATIONS
+# ============================================================================
+
+class Commands:
+    """All command implementations"""
+
+    # Help text database
+    HELP_TEXT = {
+        "help": "help [command]\n  Show all commands or help for a specific command",
+        "mk": "mk dir <name>  — Create directory\nmk file <name> [content]  — Create file",
+        "cpy": "cpy <src> <dst>  — Copy file or directory",
+        "dlt": "dlt <path>  — Delete file or directory",
+        "move": "move file <src> <dst>  — Move/rename file",
+        "cd": "cd <path>  — Change directory\ncd  — Show current directory",
+        "pwd": "pwd  — Print working directory",
+        "dirlook": "dirlook  — List directory contents",
+        "opnlnk": "opnlnk <url>  — Open URL in browser",
+        "opn": "opn <path>  — Open file with default application",
+        "ex": "ex  — Open file explorer (Windows only)",
+        "task": "task  — List running processes",
+        "kill": "kill task <name>  — Force kill process",
+        "clo": "clo task <name>  — Close process gracefully",
+        "say": "say <text>  — Print text (expands variables)",
+        "undo": "undo  — Undo last file operation",
+        "redo": "redo  — Redo last undone operation",
+        "add": "add <n1> <n2> [...]  — Add numbers",
+        "sub": "sub <n1> <n2> [...]  — Subtract numbers",
+        "mul": "mul <n1> <n2> [...]  — Multiply numbers",
+        "div": "div <n1> <n2> [...]  — Divide numbers",
+        "alia": "alia  — List all aliases\nalia <name> <command>  — Create alias",
+        "unalia": "unalia <name>  — Remove alias",
+        "let": "let <name> = <value>  — Set variable\nlet -r <name> = <value>  — Set readonly variable",
+        "var": "var  — List all variables",
+        "unset": "unset <name>  — Remove variable",
+        "export": "export <name>  — Export variable to environment",
+        "if": "if <condition> then <command>",
+        "wait": "wait <seconds>  — Pause execution",
+        "rpt": "rpt <count|inf> <command>  — Repeat command\nrpt <count|inf> ... endrpt  — Repeat block",
+        "ask": "ask <varname> [prompt]  — Prompt for input",
+        "exit": "exit [code]  — Exit with code",
+        "exists": "exists <path>  — Check if path exists",
+        "arg": "arg <n>  — Get script argument\narg count  — Count arguments",
+        "prof": "prof  — List profiles\nprof <name>  — Switch profile\nprof new <name>  — Create profile\nprof del <name>  — Delete profile",
+        "run": "run <file.sig>  — Run script file",
+        "inc": "inc <file.sig>  — Include script file",
+        "wrt": "wrt line <n> <text> <file>  — Write line to file\nwrt json <key.path> <value> <file>  — Write JSON value",
+        "gp": "gp <title> ... endgp  — Graphical prompt dialog",
+        "case": "case <var> ... when <val> ... else ... endcase  — Switch statement",
+        "goto": "goto <label>  — Jump to label",
+        "brk": "brk  — Break from loop/case",
+        "pin": "pin <path>  — Install plugin",
+        "prv": "prv <name>  — Remove plugin",
+    }
+
+    @staticmethod
+    def help(args: List[str]) -> None:
+        """Show help information"""
+        if not args:
+            print("\n🔮 Sigil Commands:\n")
+            categories = {
+                "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex"],
+                "Process": ["task", "kill", "clo"],
+                "Output": ["say"],
+                "Math": ["add", "sub", "mul", "div"],
+                "Variables": ["let", "var", "unset", "export", "alia", "unalia"],
+                "Control": ["if", "case", "rpt", "goto", "brk", "exit"],
+                "I/O": ["ask", "wrt", "gp"],
+                "Scripts": ["run", "inc", "exists", "arg"],
+                "Config": ["prof"],
+                "Plugins": ["pin", "prv"],
+                "Shell": ["ps", "cmd", "sh"],
+            }
+
+            for category, cmds in categories.items():
+                print(f"  {category}:")
+                for cmd in cmds:
+                    if cmd in Commands.HELP_TEXT:
+                        desc = Commands.HELP_TEXT[cmd].split('\n')[0].split('—')[-1].strip()
+                        print(f"    {cmd:12} — {desc}")
+                print()
+
+            print("Type: help <command> for details\n")
+            print("Comments: & # // single-line, /* */ block comments\n")
+            return
+
+        cmd_name = args[0]
+        if cmd_name in Commands.HELP_TEXT:
+            print(f"\n{Commands.HELP_TEXT[cmd_name]}\n")
+        else:
+            print(f"⚠ No help available for: {cmd_name}")
+
+    @staticmethod
+    def mk(args: List[str]) -> None:
+        """Make directory or file"""
+        if len(args) < 2:
+            print(Commands.HELP_TEXT["mk"])
+            set_last_exit(1)
+            return
+
+        target_type = args[0]
+
+        if target_type == "dir":
+            path = resolve_path(args[1])
+            existed = path.exists()
+
+            if not existed:
+                path.mkdir(parents=True, exist_ok=True)
+
+            UndoManager.push({
+                "op": "mk_dir",
+                "path": str(path),
+                "existed": existed
+            })
+            print(f"✓ Created directory: {path}")
+            set_last_exit(0)
+
+        elif target_type == "file":
+            path = resolve_path(args[1])
+            content = " ".join(args[2:]) if len(args) > 2 else ""
+            existed = path.exists()
+            backup = None
+
+            if existed:
+                backup = UndoManager.backup_contents(path)
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+            UndoManager.push({
+                "op": "mk_file",
+                "path": str(path),
+                "existed": existed,
+                "backup": str(backup) if backup else None
+            })
+            print(f"✓ Created file: {path}")
+            set_last_exit(0)
+        else:
+            print("⚠ Unknown target type (use 'dir' or 'file')")
+            set_last_exit(1)
+
+    @staticmethod
+    def cpy(args: List[str]) -> None:
+        """Copy file or directory"""
+        if len(args) < 2:
+            print(Commands.HELP_TEXT["cpy"])
+            set_last_exit(1)
+            return
+
+        src = resolve_path(args[0])
+        dst = resolve_path(args[1])
+
+        if not src.exists():
+            print(f"⚠ Source does not exist: {src}")
+            set_last_exit(1)
+            return
+
+        dst_existed = dst.exists()
+        dst_backup = None
+
+        if dst_existed:
+            if dst.is_dir():
+                dst_backup = UndoManager.backup_path(dst)
+            else:
+                dst_backup = UndoManager.backup_contents(dst)
+
+        try:
+            if src.is_dir():
+                if dst.exists():
+                    print(f"⚠ Destination already exists: {dst}")
+                    set_last_exit(1)
+                    return
+                shutil.copytree(str(src), str(dst))
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+
+            UndoManager.push({
+                "op": "cpy",
+                "src": str(src),
+                "dst": str(dst),
+                "dst_existed": dst_existed,
+                "dst_backup": str(dst_backup) if dst_backup else None
+            })
+
+            print(f"✓ Copied: {src} → {dst}")
+            set_last_exit(0)
+
+        except Exception as e:
+            print(f"⚠ Copy failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def dlt(args: List[str]) -> None:
+        """Delete file or directory"""
+        if not args:
+            print(Commands.HELP_TEXT["dlt"])
+            set_last_exit(1)
+            return
+
+        path = resolve_path(args[0])
+
+        if not path.exists():
+            print(f"⚠ Path does not exist: {path}")
+            set_last_exit(1)
+            return
+
+        backup = UndoManager.backup_path(path)
+
+        UndoManager.push({
+            "op": "dlt",
+            "path": str(path),
+            "backup": str(backup) if backup else None
+        })
+
+        print(f"✓ Deleted: {path}")
+        set_last_exit(0)
+
+    @staticmethod
+    def move(args: List[str]) -> None:
+        """Move/rename file"""
+        if len(args) < 3 or args[0] != "file":
+            print(Commands.HELP_TEXT["move"])
+            set_last_exit(1)
+            return
+
+        src = resolve_path(args[1])
+        dst = resolve_path(args[2])
+
+        if not src.exists():
+            print(f"⚠ Source does not exist: {src}")
+            set_last_exit(1)
+            return
+
+        dst_existed = dst.exists()
+        dst_backup = None
+
+        if dst_existed:
+            if dst.is_dir():
+                dst_backup = UndoManager.backup_path(dst)
+            else:
+                dst_backup = UndoManager.backup_contents(dst)
+
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+
+            UndoManager.push({
+                "op": "move",
+                "src": str(src),
+                "dst": str(dst),
+                "dst_existed": dst_existed,
+                "dst_backup": str(dst_backup) if dst_backup else None
+            })
+
+            print(f"✓ Moved: {src} → {dst}")
+            set_last_exit(0)
+
+        except Exception as e:
+            print(f"⚠ Move failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def cd(args: List[str]) -> None:
+        """Change directory"""
+        if not args:
+            print(State.current_dir)
+            set_last_exit(0)
+            return
+
+        path = resolve_path(args[0])
+
+        if path.is_dir():
+            State.current_dir = path
+            print(f"📁 {State.current_dir}")
+            set_last_exit(0)
+        else:
+            print(f"⚠ Not a directory: {path}")
+            set_last_exit(1)
+
+    @staticmethod
+    def pwd(args: List[str]) -> None:
+        """Print working directory"""
+        print(State.current_dir)
+        set_last_exit(0)
+
+    @staticmethod
+    def dirlook(args: List[str]) -> None:
+        """List directory contents"""
+        print(f"\n📁 {State.current_dir}\n")
+        try:
+            items = sorted(State.current_dir.iterdir())
+            for item in items:
+                if item.is_dir():
+                    print(f"  📂 {item.name}/")
+                else:
+                    size = item.stat().st_size
+                    size_str = f"{size:,}" if size < 1024 else f"{size/1024:.1f}K"
+                    print(f"  📄 {item.name:40} {size_str:>10}")
+            set_last_exit(0)
+        except PermissionError:
+            print("⚠ Permission denied")
+            set_last_exit(1)
+
+    @staticmethod
+    def opnlnk(args: List[str]) -> None:
+        """Open URL in browser"""
+        if not args:
+            print(Commands.HELP_TEXT["opnlnk"])
+            set_last_exit(1)
+            return
+
+        try:
+            webbrowser.open(args[0])
+            print(f"✓ Opened: {args[0]}")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Failed to open URL: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def opn(args: List[str]) -> None:
+        """Open file with default application"""
+        if not args:
+            print(Commands.HELP_TEXT["opn"])
+            set_last_exit(1)
+            return
+
+        path = resolve_path(args[0])
+
+        if not path.exists():
+            print(f"⚠ Path does not exist: {path}")
+            set_last_exit(1)
+            return
+
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(path)])
+            else:
+                subprocess.run(["xdg-open", str(path)])
+
+            print(f"✓ Opened: {path}")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Failed to open: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def ex(args: List[str]) -> None:
+        """Open file explorer"""
+        if os.name == "nt":
+            subprocess.Popen(["explorer", str(State.current_dir)])
+            print(f"✓ Opened explorer: {State.current_dir}")
+            set_last_exit(0)
+        else:
+            print("⚠ Explorer only supported on Windows")
+            set_last_exit(1)
+
+    @staticmethod
+    def task(args: List[str]) -> None:
+        """List running processes"""
+        try:
+            if os.name == "nt":
+                result = subprocess.run(["tasklist"], capture_output=True, text=True)
+            else:
+                result = subprocess.run(["ps", "-e"], capture_output=True, text=True)
+
+            print(result.stdout)
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Failed to list tasks: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def kill(args: List[str]) -> None:
+        """Kill process"""
+        if len(args) < 2 or args[0] != "task":
+            print(Commands.HELP_TEXT["kill"])
+            set_last_exit(1)
+            return
+
+        name = args[1]
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/IM", name, "/F"], check=True)
+            else:
+                subprocess.run(["pkill", "-9", name], check=True)
+
+            print(f"✓ Killed: {name}")
+            set_last_exit(0)
+        except subprocess.CalledProcessError:
+            print(f"⚠ Failed to kill: {name}")
+            set_last_exit(1)
+
+    @staticmethod
+    def clo(args: List[str]) -> None:
+        """Close process gracefully"""
+        if len(args) < 2 or args[0] != "task":
+            print(Commands.HELP_TEXT["clo"])
+            set_last_exit(1)
+            return
+
+        name = args[1]
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/IM", name], check=True)
+            else:
+                subprocess.run(["pkill", name], check=True)
+
+            print(f"✓ Closed: {name}")
+            set_last_exit(0)
+        except subprocess.CalledProcessError:
+            print(f"⚠ Failed to close: {name}")
+            set_last_exit(1)
+
+    @staticmethod
+    def say(args: List[str]) -> None:
+        """Print text with variable expansion"""
+        parts = []
+        for token in args:
+            if token.startswith("$") and token[1:] in State.variables:
+                parts.append(str(State.variables[token[1:]]))
+            elif token in State.variables:
+                parts.append(str(State.variables[token]))
+            else:
+                parts.append(token)
+
+        print(" ".join(parts))
+        set_last_exit(0)
+
+    @staticmethod
+    def add(args: List[str]) -> None:
+        """Add numbers"""
+        if not args:
+            print(Commands.HELP_TEXT["add"])
+            set_last_exit(1)
+            return
+
+        try:
+            numbers = parse_numbers(args)
+            result = sum(numbers)
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            print(result)
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Error: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def sub(args: List[str]) -> None:
+        """Subtract numbers"""
+        if len(args) < 2:
+            print(Commands.HELP_TEXT["sub"])
+            set_last_exit(1)
+            return
+
+        try:
+            numbers = parse_numbers(args)
+            result = numbers[0]
+            for num in numbers[1:]:
+                result -= num
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            print(result)
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Error: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def mul(args: List[str]) -> None:
+        """Multiply numbers"""
+        if not args:
+            print(Commands.HELP_TEXT["mul"])
+            set_last_exit(1)
+            return
+
+        try:
+            numbers = parse_numbers(args)
+            result = 1
+            for num in numbers:
+                result *= num
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            print(result)
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Error: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def div(args: List[str]) -> None:
+        """Divide numbers"""
+        if len(args) < 2:
+            print(Commands.HELP_TEXT["div"])
+            set_last_exit(1)
+            return
+
+        try:
+            numbers = parse_numbers(args)
+            result = float(numbers[0])
+            for num in numbers[1:]:
+                if num == 0:
+                    print("⚠ Division by zero")
+                    set_last_exit(1)
+                    return
+                result /= num
+
+            if result.is_integer():
+                result = int(result)
+            print(result)
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Error: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def alia(args: List[str]) -> None:
+        """Manage aliases"""
+        if not args:
+            if not State.aliases:
+                print("No aliases defined")
+                set_last_exit(1)
+                return
+
+            print("\n📝 Aliases:\n")
+            for name, cmd in sorted(State.aliases.items()):
+                print(f"  {name:15} → {cmd}")
+            print()
+            set_last_exit(0)
+            return
+
+        if len(args) >= 2:
+            name = args[0]
+            cmd_str = " ".join(args[1:])
+            State.aliases[name] = cmd_str
+
+            if not State.loading_rc:
+                RCManager.save()
+
+            print(f"✓ Alias set: {name} → {cmd_str}")
+            set_last_exit(0)
+        else:
+            print(Commands.HELP_TEXT["alia"])
+            set_last_exit(1)
+
+    @staticmethod
+    def unalia(args: List[str]) -> None:
+        """Remove alias"""
+        if not args:
+            print(Commands.HELP_TEXT["unalia"])
+            set_last_exit(1)
+            return
+
+        name = args[0]
+        if name in State.aliases:
+            del State.aliases[name]
+            if not State.loading_rc:
+                RCManager.save()
+            print(f"✓ Alias removed: {name}")
+            set_last_exit(0)
+        else:
+            print(f"⚠ Alias not found: {name}")
+            set_last_exit(1)
+
+    @staticmethod
+    def let(args: List[str]) -> None:
+        """Set variable"""
+        if not args:
+            print(Commands.HELP_TEXT["let"])
+            set_last_exit(1)
+            return
+
+        # Check for readonly flag
+        readonly = False
+        if args[0] == "-r":
+            readonly = True
+            args = args[1:]
+
+        if not args:
+            print(Commands.HELP_TEXT["let"])
+            set_last_exit(1)
+            return
+
+        # Parse variable name and value
+        if len(args) == 1:
+            name = args[0]
+            value = ""
+        elif len(args) >= 3 and args[1] == "=":
+            name = args[0]
+            value = " ".join(args[2:])
+        elif len(args) >= 2:
+            name = args[0]
+            value = " ".join(args[1:])
+        else:
+            print(Commands.HELP_TEXT["let"])
+            set_last_exit(1)
+            return
+
+        # Check for readonly violation
+        if name in State.readonly_vars and not readonly:
+            print(f"⚠ Cannot modify readonly variable: {name}")
+            set_last_exit(1)
+            return
+
+        # Process value
+        tokens = TextProcessor.tokenize(value)
+
+        # Handle 'ask' sugar: let x = ask "prompt"
+        if tokens and tokens[0] == 'ask':
+            prompt = " ".join(tokens[1:]) if len(tokens) > 1 else ""
+            if prompt.startswith('"') and prompt.endswith('"'):
+                prompt = prompt[1:-1]
+            else:
+                prompt = TextProcessor.expand_vars_in_string(prompt)
+
+            try:
+                entered = input(prompt + (" " if prompt else ""))
+            except EOFError:
+                entered = ""
+
+            final_value = entered
+        else:
+            # Normal value processing
+            if value.startswith('"') and value.endswith('"'):
+                final_value = value[1:-1].replace('\\"', '"')
+                final_value = TextProcessor.expand_vars_in_string(final_value)
+            else:
+                expanded = TextProcessor.expand_vars_in_string(value)
+                # Try to parse as number
+                try:
+                    if "." in expanded or "e" in expanded.lower():
+                        final_value = float(expanded)
+                    else:
+                        final_value = int(expanded)
+                except (ValueError, TypeError):
+                    final_value = expanded
+
+        # Set variable
+        State.variables[name] = final_value
+
+        if readonly:
+            State.readonly_vars.add(name)
+        else:
+            State.readonly_vars.discard(name)
+
+        if not State.loading_rc:
+            RCManager.save()
+
+        print(f"✓ {name} = {final_value}")
+        set_last_exit(0)
+
+    @staticmethod
+    def var(args: List[str]) -> None:
+        """List variables"""
+        if not State.variables:
+            print("No variables defined")
+            set_last_exit(1)
+            return
+
+        print("\n💾 Variables:\n")
+        for name, value in sorted(State.variables.items()):
+            flags = []
+            if name in State.readonly_vars:
+                flags.append("readonly")
+            if name in State.exported_vars:
+                flags.append("exported")
+
+            flag_str = f" ({', '.join(flags)})" if flags else ""
+            print(f"  {name:15} = {value}{flag_str}")
+        print()
+        set_last_exit(0)
+
+    @staticmethod
+    def unset(args: List[str]) -> None:
+        """Remove variable"""
+        if not args:
+            print(Commands.HELP_TEXT["unset"])
+            set_last_exit(1)
+            return
+
+        name = args[0]
+
+        if name not in State.variables:
+            print(f"⚠ Variable not found: {name}")
+            set_last_exit(1)
+            return
+
+        if name in State.readonly_vars:
+            print(f"⚠ Cannot unset readonly variable: {name}")
+            set_last_exit(1)
+            return
+
+        del State.variables[name]
+        State.exported_vars.discard(name)
+
+        if not State.loading_rc:
+            RCManager.save()
+
+        print(f"✓ Unset: {name}")
+        set_last_exit(0)
+
+    @staticmethod
+    def export(args: List[str]) -> None:
+        """Export variable to environment"""
+        if not args:
+            print(Commands.HELP_TEXT["export"])
+            set_last_exit(1)
+            return
+
+        name = args[0]
+
+        if name not in State.variables:
+            print(f"⚠ Variable not defined: {name}")
+            set_last_exit(1)
+            return
+
+        State.exported_vars.add(name)
+        os.environ[name] = str(State.variables[name])
+
+        if not State.loading_rc:
+            RCManager.save()
+
+        print(f"✓ Exported: {name}")
+        set_last_exit(0)
+
+    @staticmethod
+    def ask(args: List[str]) -> None:
+        """Prompt for user input"""
+        if not args:
+            print(Commands.HELP_TEXT["ask"])
+            set_last_exit(1)
+            return
+
+        # Parse: ask = <name> or ask <name> [prompt]
+        if args[0] == "=":
+            if len(args) < 2:
+                print(Commands.HELP_TEXT["ask"])
+                set_last_exit(1)
+                return
+            name = args[1]
+            prompt = ""
+        else:
+            name = args[0]
+            prompt = " ".join(args[1:]) if len(args) > 1 else ""
+            if prompt.startswith('"') and prompt.endswith('"'):
+                prompt = prompt[1:-1]
+
+        try:
+            value = input(prompt + (" " if prompt else ""))
+        except EOFError:
+            value = ""
+
+        State.variables[name] = value
+        set_last_exit(0)
+
+    @staticmethod
+    def wait(args: List[str]) -> None:
+        """Pause execution"""
+        if not args:
+            print(Commands.HELP_TEXT["wait"])
+            set_last_exit(1)
+            return
+
+        try:
+            seconds = float(args[0])
+            time.sleep(seconds)
+            set_last_exit(0)
+        except (ValueError, TypeError):
+            print("⚠ Invalid number")
+            set_last_exit(1)
+
+    @staticmethod
+    def exists(args: List[str]) -> None:
+        """Check if path exists"""
+        if not args:
+            print(Commands.HELP_TEXT["exists"])
+            set_last_exit(1)
+            return
+
+        path = resolve_path(args[0])
+        exists = path.exists()
+
+        print("yes" if exists else "no")
+        set_last_exit(0 if exists else 1)
+
+    @staticmethod
+    def arg(args: List[str]) -> None:
+        """Get script argument"""
+        if not args:
+            print(Commands.HELP_TEXT["arg"])
+            set_last_exit(1)
+            return
+
+        if args[0] == "count":
+            print(len(State.script_args))
+            set_last_exit(0)
+        else:
+            try:
+                index = int(args[0])
+                if 0 <= index < len(State.script_args):
+                    print(State.script_args[index])
+                    set_last_exit(0)
+                else:
+                    print(f"⚠ Index out of range: {index}")
+                    set_last_exit(1)
+            except (ValueError, TypeError):
+                print("⚠ Invalid index")
+                set_last_exit(1)
+
+    @staticmethod
+    def prof(args: List[str]) -> None:
+        """Manage profiles"""
+        if not args:
+            # List profiles
+            profiles = {"default"}
+            try:
+                for item in Config.CONFIG_DIR.iterdir():
+                    if item.name.startswith(".sigilrc."):
+                        name = item.name.replace(".sigilrc.", "")
+                        if not name.endswith(".bak"):
+                            profiles.add(name)
+            except Exception:
+                pass
+
+            print("\n👤 Profiles:\n")
+            for profile in sorted(profiles):
+                current = " (current)" if profile == State.current_profile else ""
+                print(f"  {profile}{current}")
+            print()
+            set_last_exit(0)
+            return
+
+        subcommand = args[0]
+
+        if subcommand == "show":
+            print(f"Current profile: {State.current_profile}")
+            set_last_exit(0)
+            return
+
+        if subcommand == "new" and len(args) == 2:
+            name = args[1]
+            path = RCManager.get_rc_path(name)
+
+            if path.exists():
+                print(f"⚠ Profile already exists: {name}")
+                set_last_exit(1)
+                return
+
+            path.write_text(f"# Sigil Profile: {name}\n", encoding="utf-8")
+            print(f"✓ Created profile: {name}")
+            set_last_exit(0)
+            return
+
+        if subcommand == "del" and len(args) == 2:
+            name = args[1]
+
+            if name == "default":
+                print("⚠ Cannot delete default profile")
+                set_last_exit(1)
+                return
+
+            path = RCManager.get_rc_path(name)
+
+            if not path.exists():
+                print(f"⚠ Profile not found: {name}")
+                set_last_exit(1)
+                return
+
+            path.unlink()
+            print(f"✓ Deleted profile: {name}")
+            set_last_exit(0)
+            return
+
+        # Switch to profile
+        name = subcommand
+        State.current_profile = name
+        State.aliases.clear()
+        State.variables.clear()
+        State.readonly_vars.clear()
+        State.exported_vars.clear()
+
+        path = RCManager.get_rc_path()
+        if not path.exists():
+            path.write_text(f"# Sigil Profile: {name}\n", encoding="utf-8")
+
+        RCManager.load()
+        print(f"✓ Switched to profile: {name}")
+        set_last_exit(0)
+
+    @staticmethod
+    def run(args: List[str]) -> None:
+        """Run script file"""
+        if not args:
+            print(Commands.HELP_TEXT["run"])
+            set_last_exit(1)
+            return
+
+        path = resolve_path(args[0])
+
+        if not path.exists():
+            print(f"⚠ File not found: {path}")
+            set_last_exit(1)
+            return
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+
+            # Save context
+            prev_file = State.script_file
+            prev_dir = State.script_dir
+            prev_args = State.script_args[:]
+
+            try:
+                State.script_file = str(path)
+                State.script_dir = str(path.parent)
+                State.script_args = args[1:] if len(args) > 1 else []
+
+                Interpreter.run_lines(lines)
+            finally:
+                State.script_file = prev_file
+                State.script_dir = prev_dir
+                State.script_args = prev_args
+
+        except Exception as e:
+            print(f"⚠ Script error: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def inc(args: List[str]) -> None:
+        """Include script file"""
+        if not args:
+            print(Commands.HELP_TEXT["inc"])
+            set_last_exit(1)
+            return
+
+        path = resolve_path(args[0])
+
+        if not path.exists():
+            print(f"⚠ File not found: {path}")
+            set_last_exit(1)
+            return
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            Interpreter.run_lines(lines)
+        except Exception as e:
+            print(f"⚠ Include error: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def wrt(args: List[str]) -> None:
+        """Write to file"""
+        if not args:
+            print(Commands.HELP_TEXT["wrt"])
+            set_last_exit(1)
+            return
+
+        mode = args[0]
+
+        if mode == "line":
+            if len(args) < 4:
+                print(Commands.HELP_TEXT["wrt"])
+                set_last_exit(1)
+                return
+
+            try:
+                line_num = int(args[1])
+            except (ValueError, TypeError):
+                print("⚠ Invalid line number")
+                set_last_exit(1)
+                return
+
+            text = args[2]
+            if text.startswith('"') and text.endswith('"'):
+                text = text[1:-1].replace('\\"', '"')
+
+            path = resolve_path(args[3])
+
+            try:
+                lines = []
+                if path.exists():
+                    lines = path.read_text(encoding="utf-8").splitlines()
+
+                # Ensure enough lines
+                while len(lines) < line_num:
+                    lines.append("")
+
+                lines[line_num - 1] = text
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+                print(f"✓ Wrote line {line_num} to {path}")
+                set_last_exit(0)
+            except Exception as e:
+                print(f"⚠ Write failed: {e}")
+                set_last_exit(1)
+
+        elif mode == "json":
+            if len(args) < 4:
+                print(Commands.HELP_TEXT["wrt"])
+                set_last_exit(1)
+                return
+
+            key_path = args[1]
+            value_token = args[2]
+            file_path = resolve_path(args[3])
+
+            # Parse value
+            if value_token.lower() == "true":
+                value = True
+            elif value_token.lower() == "false":
+                value = False
+            elif value_token.lower() == "null":
+                value = None
+            elif value_token.startswith('"') and value_token.endswith('"'):
+                value = value_token[1:-1].replace('\\"', '"')
+            else:
+                try:
+                    if "." in value_token or "e" in value_token.lower():
+                        value = float(value_token)
+                    else:
+                        value = int(value_token)
+                except (ValueError, TypeError):
+                    value = value_token
+
+            try:
+                # Load existing JSON
+                data = {}
+                if file_path.exists():
+                    try:
+                        data = json.loads(file_path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError:
+                        data = {}
+
+                # Navigate to nested key
+                parts = key_path.split(".")
+                current = data
+
+                for part in parts[:-1]:
+                    if part not in current or not isinstance(current[part], dict):
+                        current[part] = {}
+                    current = current[part]
+
+                current[parts[-1]] = value
+
+                # Write JSON
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+                print(f"✓ Wrote {key_path} = {value} to {file_path}")
+                set_last_exit(0)
+            except Exception as e:
+                print(f"⚠ JSON write failed: {e}")
+                set_last_exit(1)
+        else:
+            print(f"⚠ Unknown mode: {mode}")
+            set_last_exit(1)
+
+    @staticmethod
+    def undo(args: List[str]) -> None:
+        """Undo last file operation"""
+        if not State.undo_stack:
+            print("⚠ Nothing to undo")
+            set_last_exit(1)
+            return
+
+        action = State.undo_stack.pop()
+        State.redo_stack.append(action)
+
+        op = action.get("op")
+        try:
+            if op == "mk_file":
+                path = Path(action["path"])
+                existed = action.get("existed", False)
+                backup = action.get("backup")
+                if existed and backup:
+                    # restore previous contents
+                    shutil.copy2(backup, str(path))
+                else:
+                    if path.exists():
+                        if path.is_dir():
+                            shutil.rmtree(str(path))
+                        else:
+                            path.unlink()
+            elif op == "mk_dir":
+                path = Path(action["path"])
+                if path.exists() and path.is_dir():
+                    shutil.rmtree(str(path))
+            elif op == "dlt":
+                backup = action.get("backup")
+                if backup:
+                    # move back
+                    UndoManager.safe_move(Path(backup), Path(action["path"]))
+            elif op in ("cpy", "move"):
+                # best-effort restore
+                dst = Path(action.get("dst", ""))
+                src = Path(action.get("src", ""))
+                dst_backup = action.get("dst_backup")
+                if op == "cpy":
+                    if dst.exists():
+                        if dst.is_dir():
+                            shutil.rmtree(str(dst))
+                        else:
+                            dst.unlink()
+                    if dst_backup:
+                        UndoManager.safe_move(Path(dst_backup), dst)
+                elif op == "move":
+                    # move back
+                    if dst.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(dst), str(src))
+                    if dst_backup:
+                        UndoManager.safe_move(Path(dst_backup), dst)
+            else:
+                print(f"⚠ Unsupported undo operation: {op}")
+                set_last_exit(1)
+                return
+
+            print("✓ Undone")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Undo failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def redo(args: List[str]) -> None:
+        """Redo last undone operation"""
+        if not State.redo_stack:
+            print("⚠ Nothing to redo")
+            set_last_exit(1)
+            return
+
+        action = State.redo_stack.pop()
+        State.undo_stack.append(action)
+
+        op = action.get("op")
+        try:
+            if op == "mk_file":
+                path = Path(action["path"])
+                existed = action.get("existed", False)
+                # we can't perfectly redo content without stored content; best-effort create empty
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_text("", encoding="utf-8")
+            elif op == "mk_dir":
+                path = Path(action["path"])
+                path.mkdir(parents=True, exist_ok=True)
+            elif op == "dlt":
+                path = Path(action["path"])
+                if path.exists():
+                    if path.is_dir():
+                        shutil.rmtree(str(path))
+                    else:
+                        path.unlink()
+            elif op == "cpy":
+                src = Path(action["src"])
+                dst = Path(action["dst"])
+                if src.exists():
+                    if src.is_dir():
+                        shutil.copytree(str(src), str(dst))
+                    else:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(src), str(dst))
+            elif op == "move":
+                src = Path(action["src"])
+                dst = Path(action["dst"])
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+            else:
+                print(f"⚠ Unsupported redo operation: {op}")
+                set_last_exit(1)
+                return
+
+            print("✓ Redone")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Redo failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def pin(args: List[str]) -> None:
+        """Install plugin from path (copy to plugin dir)"""
+        if not args:
+            print(Commands.HELP_TEXT["pin"])
+            set_last_exit(1)
+            return
+
+        src = resolve_path(args[0])
+        if not src.exists():
+            print(f"⚠ Plugin not found: {src}")
+            set_last_exit(1)
+            return
+
+        dst = Config.PLUGIN_DIR / src.name
+        try:
+            if src.is_dir():
+                if dst.exists():
+                    print("⚠ Plugin already installed")
+                    set_last_exit(1)
+                    return
+                shutil.copytree(str(src), str(dst))
+            else:
+                shutil.copy2(str(src), str(dst))
+            State.plugin_registry[src.name] = str(dst)
+            print(f"✓ Plugin installed: {src.name}")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Plugin install failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def prv(args: List[str]) -> None:
+        """Remove plugin"""
+        if not args:
+            print(Commands.HELP_TEXT["prv"])
+            set_last_exit(1)
+            return
+
+        name = args[0]
+        dst = Config.PLUGIN_DIR / name
+        if not dst.exists():
+            print(f"⚠ Plugin not installed: {name}")
+            set_last_exit(1)
+            return
+
+        try:
+            if dst.is_dir():
+                shutil.rmtree(str(dst))
+            else:
+                dst.unlink()
+            State.plugin_registry.pop(name, None)
+            print(f"✓ Plugin removed: {name}")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Plugin remove failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def gp(args: List[str]) -> None:
+        """Graphical prompt block stub: collects lines until endgp and prints them as a dialog summary."""
+        # Real GUI would require tkinter/others; keep as stub that writes variables from gp block.
+        title = " ".join(args) if args else "Prompt"
+        print(f"[Graphical prompt: {title}] (using console fallback)")
+        # In actual gp block, Interpreter collects the block; here just placeholder.
+        set_last_exit(0)
+
+    @staticmethod
+    def case(args: List[str]) -> None:
+        """Case is implemented in interpreter control flow; this function is present for completeness."""
+        print("⚠ 'case' should be used as a block and is handled by the interpreter.")
+        set_last_exit(1)
+
+    @staticmethod
+    def exit_cmd(args: List[str]) -> None:
+        """Exit shell"""
+        code = 0
+        if args:
+            try:
+                code = int(args[0])
+            except (ValueError, TypeError):
+                code = 1
+
+        set_last_exit(code)
+        raise SystemExit(code)
+
+    @staticmethod
+    def brk(args: List[str]) -> None:
+        """Break from loop/case by raising BreakException"""
+        raise BreakException()
+
+# Command registry
+COMMAND_REGISTRY = {
+    "help": Commands.help,
+    "mk": Commands.mk,
+    "cpy": Commands.cpy,
+    "dlt": Commands.dlt,
+    "move": Commands.move,
+    "cd": Commands.cd,
+    "pwd": Commands.pwd,
+    "dirlook": Commands.dirlook,
+    "opnlnk": Commands.opnlnk,
+    "opn": Commands.opn,
+    "ex": Commands.ex,
+    "task": Commands.task,
+    "kill": Commands.kill,
+    "clo": Commands.clo,
+    "say": Commands.say,
+    "add": Commands.add,
+    "sub": Commands.sub,
+    "mul": Commands.mul,
+    "div": Commands.div,
+    "alia": Commands.alia,
+    "unalia": Commands.unalia,
+    "let": Commands.let,
+    "var": Commands.var,
+    "unset": Commands.unset,
+    "export": Commands.export,
+    "ask": Commands.ask,
+    "wait": Commands.wait,
+    "sleep": Commands.wait,
+    "exists": Commands.exists,
+    "arg": Commands.arg,
+    "prof": Commands.prof,
+    "run": Commands.run,
+    "inc": Commands.inc,
+    "include": Commands.inc,
+    "wrt": Commands.wrt,
+    "undo": Commands.undo,
+    "redo": Commands.redo,
+    "pin": Commands.pin,
+    "prv": Commands.prv,
+    "gp": Commands.gp,
+    "case": Commands.case,
+    "exit": Commands.exit_cmd,
+    "quit": Commands.exit_cmd,
+    "ps": ShellRunner.powershell,
+    "cmd": ShellRunner.cmd,
+    "cp": ShellRunner.cmd,
+    "sh": ShellRunner.sh,
+    "brk": Commands.brk,
+}
+
+# ============================================================================
+# INTERPRETER
+# ============================================================================
+
+class Interpreter:
+    """Script interpreter with control flow"""
+
+    LABEL_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\:$')
+
+    @staticmethod
+    def _build_label_map(lines: List[str]) -> Dict[str, int]:
+        """Scan lines for labels of form `name:` and return mapping to line index to jump to."""
+        labels: Dict[str, int] = {}
+        for idx, raw in enumerate(lines):
+            line = raw.strip()
+            m = Interpreter.LABEL_RE.match(line)
+            if m:
+                name = m.group(1)
+                # label points to next line (so a goto jumps to the first line after label)
+                labels[name] = idx + 1
+        return labels
+
+    @staticmethod
+    def _execute_line(raw_line: str) -> None:
+        """Execute a single (non-empty) line after expansion."""
+        # Expand aliases and variables before tokenizing for actual execution
+        expanded_line = TextProcessor.expand_aliases_and_vars(raw_line)
+        tokens = TextProcessor.tokenize(expanded_line)
+        if not tokens:
+            return
+
+        cmd = tokens[0]
+        args = tokens[1:]
+
+        # direct registry command
+        handler = COMMAND_REGISTRY.get(cmd)
+        if handler:
+            handler(args)
+            return
+
+        # fallback: try running as external command
+        try:
+            ShellRunner.run_and_print([cmd] + args)
+        except Exception as e:
+            print(f"⚠ Unknown command or failed to run: {cmd} ({e})")
+            set_last_exit(1)
+
+    @staticmethod
+    def _collect_block(lines: List[str], start_index: int, start_kw: str, end_kw: str) -> Tuple[List[str], int]:
+        """Collect block lines from start_index+1 until matching end_kw, handling nesting of same block type."""
+        block = []
+        depth = 0
+        i = start_index + 1
+        while i < len(lines):
+            l = lines[i].strip()
+            # detect nested start
+            if l.startswith(start_kw):
+                depth += 1
+                block.append(lines[i])
+            elif l == end_kw:
+                if depth == 0:
+                    # found matching end for this start
+                    return block, i
+                else:
+                    depth -= 1
+                    block.append(lines[i])
+            else:
+                block.append(lines[i])
+            i += 1
+        # if we get here, matching end not found
+        raise SigilError(f"Missing {end_kw} for {start_kw} starting at line {start_index+1}")
+
+    @staticmethod
+    def run_lines(lines: List[str], from_rc: bool = False) -> None:
+        """Run multiple lines with block support"""
+        # Strip comments and keep original line structure
+        in_block_comment = False
+        cleaned_lines: List[str] = []
+        for raw_line in lines:
+            line = raw_line.rstrip("\n")
+            stripped, in_block_comment = TextProcessor.strip_comments(line, in_block_comment)
+            cleaned_lines.append(stripped)
+
+        label_map = Interpreter._build_label_map(cleaned_lines)
+
+        index = 0
+        while index < len(cleaned_lines):
+            raw_line = cleaned_lines[index]
+            line = raw_line.strip()
+
+            # Skip empty lines or label definitions
+            if not line:
+                index += 1
+                continue
+            if Interpreter.LABEL_RE.match(line):
+                index += 1
+                continue
+
+            # Tokenize for control keywords
+            tokens = TextProcessor.tokenize(line)
+            if not tokens:
+                index += 1
+                continue
+
+            cmd = tokens[0]
+
+            # GOTO handling
+            if cmd == "goto":
+                if len(tokens) >= 2:
+                    label = tokens[1]
+                    if label in label_map:
+                        index = label_map[label]
+                        continue
+                    else:
+                        print(f"⚠ Label not found: {label}")
+                        set_last_exit(1)
+                else:
+                    print("⚠ goto requires a label")
+                    set_last_exit(1)
+                index += 1
+                continue
+
+            # RPT handling (inline or block)
+            if cmd == "rpt":
+                # Inline form: rpt <count|inf> <command...>
+                if len(tokens) >= 3:
+                    count_tok = tokens[1]
+                    try:
+                        if count_tok == "inf":
+                            count = None
+                        else:
+                            count = int(count_tok)
+                    except Exception:
+                        print("⚠ Invalid rpt count")
+                        set_last_exit(1)
+                        index += 1
+                        continue
+
+                    # inline command to repeat
+                    inline_cmd = " ".join(tokens[2:])
+                    try:
+                        if count is None:
+                            # infinite until brk or Ctrl-C
+                            while True:
+                                try:
+                                    Interpreter._execute_line(inline_cmd)
+                                except BreakException:
+                                    break
+                        else:
+                            for _ in range(count):
+                                try:
+                                    Interpreter._execute_line(inline_cmd)
+                                except BreakException:
+                                    break
+                        set_last_exit(0)
+                    except KeyboardInterrupt:
+                        set_last_exit(130)
+                    index += 1
+                    continue
+
+                # Block form: rpt <count|inf> ... endrpt
+                if len(tokens) >= 2:
+                    count_tok = tokens[1]
+                    try:
+                        if count_tok == "inf":
+                            count = None
+                        else:
+                            count = int(count_tok)
+                    except Exception:
+                        print("⚠ Invalid rpt count")
+                        set_last_exit(1)
+                        index += 1
+                        continue
+
+                    # collect block lines
+                    try:
+                        block_lines, end_idx = Interpreter._collect_block(cleaned_lines, index, "rpt", "endrpt")
+                    except SigilError as e:
+                        print(f"⚠ {e}")
+                        set_last_exit(1)
+                        return
+
+                    try:
+                        if count is None:
+                            # infinite
+                            while True:
+                                try:
+                                    Interpreter.run_lines(block_lines)
+                                except BreakException:
+                                    break
+                        else:
+                            for _ in range(count):
+                                try:
+                                    Interpreter.run_lines(block_lines)
+                                except BreakException:
+                                    break
+                        set_last_exit(0)
+                    except KeyboardInterrupt:
+                        set_last_exit(130)
+
+                    # jump past endrpt
+                    index = end_idx + 1
+                    continue
+
+                # malformed rpt
+                print("⚠ Malformed rpt")
+                set_last_exit(1)
+                index += 1
+                continue
+
+            # CASE handling
+            if cmd == "case":
+                if len(tokens) < 2:
+                    print("⚠ case requires a variable")
+                    set_last_exit(1)
+                    index += 1
+                    continue
+
+                var_name = tokens[1]
+                var_value = str(State.variables.get(var_name, os.environ.get(var_name, "")))
+
+                # collect case block
+                try:
+                    block_lines, end_idx = Interpreter._collect_block(cleaned_lines, index, "case", "endcase")
+                except SigilError as e:
+                    print(f"⚠ {e}")
+                    set_last_exit(1)
+                    return
+
+                # parse when / else blocks
+                chosen_block: List[str] = []
+                current_when_values = []
+                collecting = False
+                else_block: List[str] = []
+                i = 0
+                while i < len(block_lines):
+                    l = block_lines[i].strip()
+                    if l.startswith("when "):
+                        # start of when
+                        # format: when <value1> [or <value2> ...]
+                        collecting = True
+                        # parse values
+                        vals = l[5:].split()
+                        current_when_values = vals
+                        # collect lines until next when/else/endcase
+                        j = i + 1
+                        buff = []
+                        while j < len(block_lines):
+                            lj = block_lines[j].strip()
+                            if lj.startswith("when ") or lj == "else":
+                                break
+                            buff.append(block_lines[j])
+                            j += 1
+                        # if any match, choose this buff
+                        if var_value in current_when_values:
+                            chosen_block = buff
+                            break
+                        i = j
+                        continue
+                    elif l == "else":
+                        # collect else block
+                        j = i + 1
+                        buff = []
+                        while j < len(block_lines):
+                            buff.append(block_lines[j])
+                            j += 1
+                        else_block = buff
+                        break
+                    else:
+                        i += 1
+
+                if not chosen_block and else_block:
+                    chosen_block = else_block
+
+                if chosen_block:
+                    try:
+                        Interpreter.run_lines(chosen_block)
+                        set_last_exit(0)
+                    except BreakException:
+                        # silently handle break
+                        pass
+
+                index = end_idx + 1
+                continue
+
+            # 'if' inline handling: if <cond> then <command>
+            if cmd == "if":
+                # minimal if implementation supporting: if <left> <op> <right> then <command...>
+                # Example: if $x == 5 then say "yes"
+                # Tokenization already performed, so tokens[1:] includes condition and then 'then'
+                if "then" not in tokens:
+                    print("⚠ Malformed if: missing 'then'")
+                    set_last_exit(1)
+                    index += 1
+                    continue
+                then_idx = tokens.index("then")
+                cond_tokens = tokens[1:then_idx]
+                cmd_tokens = tokens[then_idx + 1:]
+                # Evaluate simple condition: left op right
+                cond_ok = False
+                try:
+                    if len(cond_tokens) == 1:
+                        left = TextProcessor.expand_vars_in_string(cond_tokens[0].strip('"'))
+                        cond_ok = bool(left)
+                    elif len(cond_tokens) >= 3:
+                        left = TextProcessor.expand_vars_in_string(cond_tokens[0].strip('"'))
+                        op = cond_tokens[1]
+                        right = TextProcessor.expand_vars_in_string(" ".join(cond_tokens[2:]).strip('"'))
+                        if op == "==" or op == "=":
+                            cond_ok = str(left) == str(right)
+                        elif op == "!=":
+                            cond_ok = str(left) != str(right)
+                        elif op in ("<", ">", "<=", ">="):
+                            try:
+                                cond_ok = float(left) if "." in str(left) else int(left)
+                                right_n = float(right) if "." in str(right) else int(right)
+                                if op == "<":
+                                    cond_ok = cond_ok < right_n
+                                elif op == ">":
+                                    cond_ok = cond_ok > right_n
+                                elif op == "<=":
+                                    cond_ok = cond_ok <= right_n
+                                elif op == ">=":
+                                    cond_ok = cond_ok >= right_n
+                            except Exception:
+                                cond_ok = False
+                        else:
+                            cond_ok = False
+                    else:
+                        cond_ok = False
+                except Exception:
+                    cond_ok = False
+
+                if cond_ok:
+                    try:
+                        Interpreter._execute_line(" ".join(cmd_tokens))
+                    except BreakException:
+                        raise
+                index += 1
+                continue
+
+            # Handle brk spelled as command (so 'brk' on a line behaves like BreakException)
+            if cmd == "brk":
+                # 'brk' executed outside of loop => raise BreakException for caller to handle
+                raise BreakException()
+
+            # Regular command execution — may raise BreakException from inside subcommands
+            try:
+                Interpreter._execute_line(line)
+            except BreakException:
+                # If brk encountered outside a rpt block, propagate upward
+                raise
+            except SystemExit:
+                # pass through exits
+                raise
+            except Exception as e:
+                # don't crash entire interpreter for a single command; report and continue
+                print(f"⚠ Error executing line '{line}': {e}")
+                set_last_exit(1)
+
+            index += 1
+
+# ============================================================================
+# REPL / MAIN
+# ============================================================================
+
+def repl():
+    """Simple interactive read-eval-print loop for Sigil"""
+    RCManager.load()
+    print(f"Sigil {Config.VERSION} — Type 'help' for commands. Ctrl-D or 'exit' to quit.")
+    try:
+        while True:
+            try:
+                raw = input("> ")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+
+            # Remove comments for the single-line REPL invocation
+            stripped, _ = TextProcessor.strip_comments(raw, False)
+            if not stripped or not stripped.strip():
+                continue
+
+            try:
+                Interpreter.run_lines([stripped])
+            except BreakException:
+                # 'brk' outside loop: ignore
+                continue
+            except SystemExit as e:
+                # propagate the exit
+                code = e.code if isinstance(e, SystemExit) else 0
+                RCManager.save()
+                sys.exit(code)
+            except Exception as e:
+                print(f"⚠ Interpreter error: {e}")
+
+    finally:
+        try:
+            RCManager.save()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    repl()
