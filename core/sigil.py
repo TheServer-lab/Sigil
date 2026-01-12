@@ -571,9 +571,11 @@ class GUIPrompt:
 
         def on_submit():
             for name, entry in entries.items():
-                if isinstance(entry, tk.Checkbutton):
+                if field_types[name] == "checkbox":
+                    # For checkboxes, get the value from the BooleanVar
                     result[name] = vars_dict[name].get()
                 else:
+                    # For other field types, get the value from the Entry widget
                     result[name] = entry.get()
             root.quit()
 
@@ -596,20 +598,26 @@ class GUIPrompt:
 
         entries = {}
         vars_dict = {}
+        field_types = {}  # Track field types
 
         for idx, (field_name, field_type) in enumerate(fields):
+            field_types[field_name] = field_type  # Store field type
+            
             label = ttk.Label(main_frame, text=field_name + ":")
             label.grid(row=idx, column=0, sticky=tk.W, pady=5)
 
             if field_type == "checkbox":
-                var = tk.BooleanVar()
+                var = tk.BooleanVar(value=False)  # Default to unchecked
                 vars_dict[field_name] = var
                 entry = ttk.Checkbutton(main_frame, variable=var)
                 entries[field_name] = entry
             elif field_type == "password":
                 entry = ttk.Entry(main_frame, show="*", width=30)
                 entries[field_name] = entry
-            else:
+            elif field_type == "number":
+                entry = ttk.Entry(main_frame, width=30)
+                entries[field_name] = entry
+            else:  # text or default
                 entry = ttk.Entry(main_frame, width=30)
                 entries[field_name] = entry
 
@@ -2030,15 +2038,23 @@ class Commands:
         title = args[0]
         if title.startswith('"') and title.endswith('"'):
             title = title[1:-1]
+        elif title.startswith("'") and title.endswith("'"):
+            title = title[1:-1]
         
         # Parse field definitions
         fields = []
         for field_def in args[1:]:
+            # Remove quotes if present
+            if field_def.startswith('"') and field_def.endswith('"'):
+                field_def = field_def[1:-1]
+            elif field_def.startswith("'") and field_def.endswith("'"):
+                field_def = field_def[1:-1]
+            
             if ':' in field_def:
                 field_name, field_type = field_def.split(':', 1)
-                fields.append((field_name, field_type))
+                fields.append((field_name.strip(), field_type.strip().lower()))
             else:
-                fields.append((field_def, "text"))
+                fields.append((field_def.strip(), "text"))
         
         if not fields:
             print("⚠ No fields specified for graphical prompt")
