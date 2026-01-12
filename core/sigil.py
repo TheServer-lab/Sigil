@@ -10,7 +10,7 @@ A feature-rich scripting shell with:
 - Plugin system
 - Cross-platform compatibility
 
-Version: 2.0
+Version: 1.0
 License: NOT MIT
 """
 
@@ -52,13 +52,23 @@ except ImportError:
     tty = None
     HAS_UNIX_TERM = False
 
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    HAS_TKINTER = True
+except ImportError:
+    tk = None
+    ttk = None
+    messagebox = None
+    HAS_TKINTER = False
+
 # ============================================================================
 # CONFIGURATION & GLOBALS
 # ============================================================================
 
 class Config:
     """Central configuration"""
-    VERSION = "2.0"
+    VERSION = "1.0"
     UNDO_LIMIT = 200
     ALIAS_RECURSION_LIMIT = 20
 
@@ -113,6 +123,37 @@ class SigilError(Exception):
 class CommandError(SigilError):
     """Error executing command"""
     pass
+
+# ============================================================================
+# KEYBOARD INPUT UTILITY
+# ============================================================================
+
+def wait_for_any_key(prompt: str = "Press any key to continue . . .") -> None:
+    """Wait for any key press (cross-platform)"""
+    print(prompt, end="", flush=True)
+    
+    try:
+        if HAS_MSVCRT:
+            # Windows implementation
+            msvcrt.getch()
+        elif HAS_UNIX_TERM:
+            # Unix/Linux implementation
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        else:
+            # Fallback for other platforms
+            input()
+    except (KeyboardInterrupt, EOFError):
+        # Handle Ctrl+C gracefully
+        print()
+        return
+    finally:
+        print()  # Newline after key press
 
 # ============================================================================
 # PERSISTENCE (RC FILES)
@@ -492,6 +533,136 @@ def parse_numbers(args: List[str]) -> List[float | int]:
     """Parse list of numbers"""
     return [parse_number(arg) for arg in args]
 
+def confirm_destructive_action(action: str) -> bool:
+    """Ask user to confirm destructive action"""
+    try:
+        response = input(f"⚠ Confirm {action}? (yes/no): ").strip().lower()
+        return response in ('yes', 'y')
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+# ============================================================================
+# GUI UTILITIES
+# ============================================================================
+
+class GUIPrompt:
+    """Handle graphical prompt dialogs using tkinter"""
+
+    @staticmethod
+    def show_prompt(title: str, fields: List[Tuple[str, str]]) -> Dict[str, str]:
+        """
+        Show a graphical prompt dialog with multiple fields.
+        
+        Args:
+            title: Dialog title
+            fields: List of (field_name, field_type) tuples
+                    field_type can be: "text", "password", "number", "checkbox"
+        
+        Returns:
+            Dictionary mapping field names to values, or empty dict if cancelled
+        """
+        if not HAS_TKINTER:
+            print("⚠ Tkinter not available, falling back to console input")
+            return GUIPrompt._console_fallback(title, fields)
+
+        result = {}
+        cancelled = [False]
+
+        def on_submit():
+            for name, entry in entries.items():
+                if isinstance(entry, tk.Checkbutton):
+                    result[name] = vars_dict[name].get()
+                else:
+                    result[name] = entry.get()
+            root.quit()
+
+        def on_cancel():
+            cancelled[0] = True
+            root.quit()
+
+        root = tk.Tk()
+        root.title(title)
+        root.geometry("400x300")
+        
+        # Center window
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() // 2) - (root.winfo_width() // 2)
+        y = (root.winfo_screenheight() // 2) - (root.winfo_height() // 2)
+        root.geometry(f"+{x}+{y}")
+
+        main_frame = ttk.Frame(root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        entries = {}
+        vars_dict = {}
+
+        for idx, (field_name, field_type) in enumerate(fields):
+            label = ttk.Label(main_frame, text=field_name + ":")
+            label.grid(row=idx, column=0, sticky=tk.W, pady=5)
+
+            if field_type == "checkbox":
+                var = tk.BooleanVar()
+                vars_dict[field_name] = var
+                entry = ttk.Checkbutton(main_frame, variable=var)
+                entries[field_name] = entry
+            elif field_type == "password":
+                entry = ttk.Entry(main_frame, show="*", width=30)
+                entries[field_name] = entry
+            else:
+                entry = ttk.Entry(main_frame, width=30)
+                entries[field_name] = entry
+
+            entry.grid(row=idx, column=1, sticky=(tk.W, tk.E), pady=5)
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=10)
+
+        submit_btn = ttk.Button(button_frame, text="OK", command=on_submit)
+        submit_btn.grid(row=0, column=0, padx=5)
+
+        cancel_btn = ttk.Button(button_frame, text="Cancel", command=on_cancel)
+        cancel_btn.grid(row=0, column=1, padx=5)
+
+        # Bind Enter to submit
+        root.bind('<Return>', lambda e: on_submit())
+        root.bind('<Escape>', lambda e: on_cancel())
+
+        # Focus first entry
+        if entries:
+            first_entry = list(entries.values())[0]
+            if not isinstance(first_entry, tk.Checkbutton):
+                first_entry.focus()
+
+        root.mainloop()
+        root.destroy()
+
+        return {} if cancelled[0] else result
+
+    @staticmethod
+    def _console_fallback(title: str, fields: List[Tuple[str, str]]) -> Dict[str, str]:
+        """Console fallback when tkinter is not available"""
+        print(f"\n{title}")
+        print("=" * len(title))
+        result = {}
+        
+        try:
+            for field_name, field_type in fields:
+                if field_type == "checkbox":
+                    value = input(f"{field_name} (yes/no): ").strip().lower()
+                    result[field_name] = value in ('yes', 'y', 'true', '1')
+                elif field_type == "password":
+                    import getpass
+                    result[field_name] = getpass.getpass(f"{field_name}: ")
+                else:
+                    result[field_name] = input(f"{field_name}: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return {}
+        
+        return result
+
 # ============================================================================
 # SHELL INTEGRATION
 # ============================================================================
@@ -618,6 +789,7 @@ class Commands:
         "export": "export <name>  — Export variable to environment",
         "if": "if <condition> then <command>",
         "wait": "wait <seconds>  — Pause execution",
+        "pse": "pse [message]  — Pause and wait for any key press",
         "rpt": "rpt <count|inf> <command>  — Repeat command\nrpt <count|inf> ... endrpt  — Repeat block",
         "ask": "ask <varname> [prompt]  — Prompt for input",
         "exit": "exit [code]  — Exit with code",
@@ -627,12 +799,14 @@ class Commands:
         "run": "run <file.sig>  — Run script file",
         "inc": "inc <file.sig>  — Include script file",
         "wrt": "wrt line <n> <text> <file>  — Write line to file\nwrt json <key.path> <value> <file>  — Write JSON value",
-        "gp": "gp <title> ... endgp  — Graphical prompt dialog",
+        "gp": "gp <title> <field:type> [...]  — Graphical prompt dialog\n  Types: text, password, number, checkbox",
         "case": "case <var> ... when <val> ... else ... endcase  — Switch statement",
         "goto": "goto <label>  — Jump to label",
         "brk": "brk  — Break from loop/case",
         "pin": "pin <path>  — Install plugin",
         "prv": "prv <name>  — Remove plugin",
+        "sdow": "sdow  — Shutdown computer (with confirmation)",
+        "shutdown": "shutdown  — Shutdown computer (with confirmation)",
     }
 
     @staticmethod
@@ -643,10 +817,11 @@ class Commands:
             categories = {
                 "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex"],
                 "Process": ["task", "kill", "clo"],
+                "System": ["sdow", "shutdown", "pse"],
                 "Output": ["say"],
                 "Math": ["add", "sub", "mul", "div"],
                 "Variables": ["let", "var", "unset", "export", "alia", "unalia"],
-                "Control": ["if", "case", "rpt", "goto", "brk", "exit"],
+                "Control": ["if", "case", "rpt", "goto", "brk", "exit", "wait", "pse"],
                 "I/O": ["ask", "wrt", "gp"],
                 "Scripts": ["run", "inc", "exists", "arg"],
                 "Config": ["prof"],
@@ -1108,7 +1283,7 @@ class Commands:
                 set_last_exit(1)
                 return
 
-            print("\n📝 Aliases:\n")
+            print("\n📖 Aliases:\n")
             for name, cmd in sorted(State.aliases.items()):
                 print(f"  {name:15} → {cmd}")
             print()
@@ -1354,6 +1529,23 @@ class Commands:
         except (ValueError, TypeError):
             print("⚠ Invalid number")
             set_last_exit(1)
+
+    @staticmethod
+    def pse(args: List[str]) -> None:
+        """Pause execution and wait for any key press"""
+        # Custom prompt if provided
+        if args:
+            prompt = " ".join(args)
+            # Handle quoted prompts
+            if prompt.startswith('"') and prompt.endswith('"'):
+                prompt = prompt[1:-1]
+            elif prompt.startswith("'") and prompt.endswith("'"):
+                prompt = prompt[1:-1]
+        else:
+            prompt = "Press any key to continue . . ."
+        
+        wait_for_any_key(prompt)
+        set_last_exit(0)
 
     @staticmethod
     def exists(args: List[str]) -> None:
@@ -1827,12 +2019,44 @@ class Commands:
 
     @staticmethod
     def gp(args: List[str]) -> None:
-        """Graphical prompt block stub: collects lines until endgp and prints them as a dialog summary."""
-        # Real GUI would require tkinter/others; keep as stub that writes variables from gp block.
-        title = " ".join(args) if args else "Prompt"
-        print(f"[Graphical prompt: {title}] (using console fallback)")
-        # In actual gp block, Interpreter collects the block; here just placeholder.
-        set_last_exit(0)
+        """Graphical prompt - parse field definitions and show GUI dialog"""
+        # Usage: gp <title> <field1:type> <field2:type> ...
+        # Example: gp "Login" username:text password:password remember:checkbox
+        if not args:
+            print(Commands.HELP_TEXT["gp"])
+            set_last_exit(1)
+            return
+
+        title = args[0]
+        if title.startswith('"') and title.endswith('"'):
+            title = title[1:-1]
+        
+        # Parse field definitions
+        fields = []
+        for field_def in args[1:]:
+            if ':' in field_def:
+                field_name, field_type = field_def.split(':', 1)
+                fields.append((field_name, field_type))
+            else:
+                fields.append((field_def, "text"))
+        
+        if not fields:
+            print("⚠ No fields specified for graphical prompt")
+            set_last_exit(1)
+            return
+        
+        # Show GUI prompt
+        result = GUIPrompt.show_prompt(title, fields)
+        
+        if result:
+            # Store results in variables
+            for field_name, value in result.items():
+                State.variables[field_name] = value
+            print(f"✓ Captured {len(result)} fields")
+            set_last_exit(0)
+        else:
+            print("⚠ Prompt cancelled")
+            set_last_exit(1)
 
     @staticmethod
     def case(args: List[str]) -> None:
@@ -1852,6 +2076,38 @@ class Commands:
 
         set_last_exit(code)
         raise SystemExit(code)
+
+    @staticmethod
+    def sdow(args: List[str]) -> None:
+        """Shutdown computer with confirmation"""
+        Commands.shutdown(args)
+
+    @staticmethod
+    def shutdown(args: List[str]) -> None:
+        """Shutdown computer with confirmation"""
+        # Confirm destructive action
+        if not confirm_destructive_action("shutdown"):
+            print("✗ Shutdown cancelled")
+            set_last_exit(1)
+            return
+
+        try:
+            print("🔌 Shutting down system...")
+            if os.name == "nt":
+                # Windows
+                subprocess.run(["shutdown", "/s", "/t", "60", "/c", "Sigil initiated shutdown"])
+            elif sys.platform == "darwin":
+                # macOS
+                subprocess.run(["sudo", "shutdown", "-h", "+1"])
+            else:
+                # Linux/Unix
+                subprocess.run(["sudo", "shutdown", "-h", "+1"])
+            
+            print("✓ Shutdown initiated (60 seconds)")
+            set_last_exit(0)
+        except Exception as e:
+            print(f"⚠ Shutdown failed: {e}")
+            set_last_exit(1)
 
     @staticmethod
     def brk(args: List[str]) -> None:
@@ -1887,6 +2143,8 @@ COMMAND_REGISTRY = {
     "export": Commands.export,
     "ask": Commands.ask,
     "wait": Commands.wait,
+    "pse": Commands.pse,
+    "pause": Commands.pse,
     "sleep": Commands.wait,
     "exists": Commands.exists,
     "arg": Commands.arg,
@@ -1908,6 +2166,8 @@ COMMAND_REGISTRY = {
     "cp": ShellRunner.cmd,
     "sh": ShellRunner.sh,
     "brk": Commands.brk,
+    "sdow": Commands.sdow,
+    "shutdown": Commands.shutdown,
 }
 
 # ============================================================================
@@ -1917,7 +2177,7 @@ COMMAND_REGISTRY = {
 class Interpreter:
     """Script interpreter with control flow"""
 
-    LABEL_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\:$')
+    LABEL_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*):')
 
     @staticmethod
     def _build_label_map(lines: List[str]) -> Dict[str, int]:
