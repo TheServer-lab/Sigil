@@ -807,7 +807,9 @@ class Commands:
         "run": "run <file.sig>  — Run script file",
         "inc": "inc <file.sig>  — Include script file",
         "wrt": "wrt line <n> <text> <file>  — Write line to file\nwrt json <key.path> <value> <file>  — Write JSON value",
-        "gp": "gp <title> <field:type> [...]  — Graphical prompt dialog\n  Types: text, password, number, checkbox",
+        "gp": "gp <message> <field1_label> <field2_label>  — Display graphical prompt with two fields",
+        "ide": "ide [filename]  — Open terminal-based code editor\n  Ctrl+S: Save, Ctrl+R: Run, Ctrl+Q: Quit, Ctrl+O: Open, Ctrl+F: Find",
+        "edit": "Alias for 'ide'",
         "case": "case <var> ... when <val> ... else ... endcase  — Switch statement",
         "goto": "goto <label>  — Jump to label",
         "brk": "brk  — Break from loop/case",
@@ -832,6 +834,7 @@ class Commands:
                 "Control": ["if", "case", "rpt", "goto", "brk", "exit", "wait", "pse"],
                 "I/O": ["ask", "wrt", "gp"],
                 "Scripts": ["run", "inc", "exists", "arg"],
+                "Editor": ["ide", "edit"],
                 "Config": ["prof"],
                 "Plugins": ["pin", "prv"],
                 "Shell": ["ps", "cmd", "sh"],
@@ -2027,51 +2030,596 @@ class Commands:
 
     @staticmethod
     def gp(args: List[str]) -> None:
-        """Graphical prompt - parse field definitions and show GUI dialog"""
-        # Usage: gp <title> <field1:type> <field2:type> ...
-        # Example: gp "Login" username:text password:password remember:checkbox
-        if not args:
-            print(Commands.HELP_TEXT["gp"])
+        """Graphical prompt with message and two fields (like in the image)"""
+        if len(args) < 3:
+            print("Usage: gp <message> <field1_label> <field2_label>")
+            print("Example: gp \"Please enter your details:\" \"Name\" \"Email\"")
             set_last_exit(1)
             return
-
-        title = args[0]
-        if title.startswith('"') and title.endswith('"'):
-            title = title[1:-1]
-        elif title.startswith("'") and title.endswith("'"):
-            title = title[1:-1]
         
-        # Parse field definitions
-        fields = []
-        for field_def in args[1:]:
-            # Remove quotes if present
-            if field_def.startswith('"') and field_def.endswith('"'):
-                field_def = field_def[1:-1]
-            elif field_def.startswith("'") and field_def.endswith("'"):
-                field_def = field_def[1:-1]
-            
-            if ':' in field_def:
-                field_name, field_type = field_def.split(':', 1)
-                fields.append((field_name.strip(), field_type.strip().lower()))
+        # Extract message and field labels
+        message = args[0]
+        field1_label = args[1]
+        field2_label = args[2]
+        
+        # Remove quotes if present
+        if message.startswith('"') and message.endswith('"'):
+            message = message[1:-1]
+        elif message.startswith("'") and message.endswith("'"):
+            message = message[1:-1]
+        
+        if field1_label.startswith('"') and field1_label.endswith('"'):
+            field1_label = field1_label[1:-1]
+        elif field1_label.startswith("'") and field1_label.endswith("'"):
+            field1_label = field1_label[1:-1]
+        
+        if field2_label.startswith('"') and field2_label.endswith('"'):
+            field2_label = field2_label[1:-1]
+        elif field2_label.startswith("'") and field2_label.endswith("'"):
+            field2_label = field2_label[1:-1]
+        
+        # Expand variables in the text
+        message = TextProcessor.expand_vars_in_string(message)
+        field1_label = TextProcessor.expand_vars_in_string(field1_label)
+        field2_label = TextProcessor.expand_vars_in_string(field2_label)
+        
+        # Create the formatted box
+        print()
+        print("+" + "-" * 38 + "+")
+        
+        # Message line (centered)
+        if message:
+            print("|" + " " * 38 + "|")
+            message_padding = 38 - len(message) - 2
+            if message_padding < 0:
+                # Message is too long, split it
+                words = message.split()
+                lines = []
+                current_line = ""
+                
+                for word in words:
+                    if len(current_line) + len(word) + 1 <= 36:
+                        current_line += (" " if current_line else "") + word
+                    else:
+                        lines.append(current_line)
+                        current_line = word
+                if current_line:
+                    lines.append(current_line)
+                
+                for line in lines:
+                    padding = 38 - len(line) - 2
+                    left_pad = padding // 2
+                    right_pad = padding - left_pad
+                    print("|" + " " * left_pad + line + " " * right_pad + "|")
             else:
-                fields.append((field_def.strip(), "text"))
+                left_pad = message_padding // 2
+                right_pad = message_padding - left_pad
+                print("|" + " " * left_pad + message + " " * right_pad + "|")
         
-        if not fields:
-            print("⚠ No fields specified for graphical prompt")
+        # Separator line
+        print("|" + " " * 38 + "|")
+        print("|" + "-" * 38 + "|")
+        
+        # First field
+        print("|" + " " * 38 + "|")
+        field1_display = f"| {field1_label}:"
+        print(field1_display + " " * (38 - len(field1_display)) + "|")
+        
+        # Second field
+        print("|" + " " * 38 + "|")
+        field2_display = f"| {field2_label}:"
+        print(field2_display + " " * (38 - len(field2_display)) + "|")
+        
+        print("|" + " " * 38 + "|")
+        print("+" + "-" * 38 + "+")
+        print()
+        
+        # Get user input for both fields
+        try:
+            field1_input = input(f"{field1_label}: ").strip()
+            field2_input = input(f"{field2_label}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             set_last_exit(1)
             return
         
-        # Show GUI prompt
-        result = GUIPrompt.show_prompt(title, fields)
+        # Store in variables (using field labels as variable names, sanitized)
+        var1_name = field1_label.lower().replace(" ", "_").replace(":", "")
+        var2_name = field2_label.lower().replace(" ", "_").replace(":", "")
         
-        if result:
-            # Store results in variables
-            for field_name, value in result.items():
-                State.variables[field_name] = value
-            print(f"✓ Captured {len(result)} fields")
-            set_last_exit(0)
+        State.variables[var1_name] = field1_input
+        State.variables[var2_name] = field2_input
+        
+        print(f"✓ Saved: {var1_name} = '{field1_input}', {var2_name} = '{field2_input}'")
+        set_last_exit(0)
+
+    @staticmethod
+    def ide(args: List[str]) -> None:
+        """Open a simple terminal-based text editor for Sigil code"""
+        import sys
+        
+        # Default filename or use provided argument
+        if args:
+            filename = args[0]
+            if filename.startswith('"') and filename.endswith('"'):
+                filename = filename[1:-1]
+            elif filename.startswith("'") and filename.endswith("'"):
+                filename = filename[1:-1]
         else:
-            print("⚠ Prompt cancelled")
+            # Prompt for filename
+            try:
+                filename = input("Enter filename: ").strip()
+                if not filename:
+                    print("⚠ No filename provided")
+                    set_last_exit(1)
+                    return
+            except (EOFError, KeyboardInterrupt):
+                print()
+                set_last_exit(1)
+                return
+        
+        # Ensure .sig extension
+        if not filename.endswith('.sig'):
+            filename += '.sig'
+        
+        filepath = resolve_path(filename)
+        
+        # Load existing content if file exists
+        content_lines = []
+        if filepath.exists():
+            try:
+                content = filepath.read_text(encoding='utf-8')
+                content_lines = content.splitlines()
+                print(f"📄 Loaded existing file: {filepath}")
+            except Exception as e:
+                print(f"⚠ Error loading file: {e}")
+                content_lines = []
+        else:
+            print(f"📝 Creating new file: {filepath}")
+        
+        # Editor state
+        cursor_pos = 0  # Line number (0-indexed)
+        cursor_col = 0  # Column position
+        editing = True
+        modified = False
+        scroll_offset = 0
+        status_msg = ""
+        status_msg_time = 0
+        
+        def clear_screen():
+            """Clear terminal screen"""
+            os.system('cls' if os.name == 'nt' else 'clear')
+        
+        def display_editor():
+            """Display editor interface"""
+            nonlocal scroll_offset, status_msg, status_msg_time
+            
+            clear_screen()
+            
+            # Editor header
+            print(f"Sigil IDE - {filepath.name} {'[MODIFIED]' if modified else ''}")
+            print("=" * 80)
+            print("Commands: Ctrl+S=Save, Ctrl+R=Run, Ctrl+Q=Quit, Ctrl+O=Open, Ctrl+F=Find")
+            print("-" * 80)
+            
+            # Calculate visible lines (terminal height minus status area)
+            term_height = 24  # Default
+            visible_lines = term_height - 8
+            
+            # Adjust scroll offset if cursor is outside visible area
+            if cursor_pos < scroll_offset:
+                scroll_offset = cursor_pos
+            elif cursor_pos >= scroll_offset + visible_lines:
+                scroll_offset = cursor_pos - visible_lines + 1
+            
+            # Display lines
+            start_line = scroll_offset
+            end_line = min(start_line + visible_lines, len(content_lines))
+            
+            for i in range(start_line, end_line):
+                line_num = i + 1
+                line_prefix = f"{line_num:4d} | "
+                
+                # Show cursor on current line
+                if i == cursor_pos:
+                    # Build line with cursor marker
+                    line_content = content_lines[i] if i < len(content_lines) else ""
+                    
+                    # Handle empty line
+                    if not line_content:
+                        print(f"> {line_prefix} \033[7m \033[0m")  # Inverted space for cursor
+                    else:
+                        # Truncate long lines
+                        display_line = line_content[:76]
+                        if cursor_col >= len(line_content):
+                            # Cursor at end
+                            print(f"> {line_prefix}{display_line}\033[7m \033[0m")
+                        else:
+                            # Cursor in middle
+                            before_cursor = display_line[:cursor_col]
+                            at_cursor = display_line[cursor_col] if cursor_col < len(display_line) else " "
+                            after_cursor = display_line[cursor_col + 1:] if cursor_col + 1 < len(display_line) else ""
+                            print(f"> {line_prefix}{before_cursor}\033[7m{at_cursor}\033[0m{after_cursor}")
+                else:
+                    # Normal line display
+                    line_content = content_lines[i] if i < len(content_lines) else ""
+                    display_line = line_content[:76]  # Truncate for display
+                    print(f"  {line_prefix}{display_line}")
+            
+            # Fill remaining lines with tildes
+            for _ in range(end_line - start_line, visible_lines):
+                print("~")
+            
+            print("-" * 80)
+            
+            # Status line
+            if status_msg and time.time() - status_msg_time < 3:
+                print(f"\033[93m{status_msg}\033[0m")  # Yellow
+            else:
+                status_msg = ""
+            
+            print(f"Line {cursor_pos + 1}/{len(content_lines)}, Col {cursor_col + 1} | Modified: {modified}")
+            print("_" * 80)
+        
+        def set_status(message: str):
+            """Set status message"""
+            nonlocal status_msg, status_msg_time
+            status_msg = message
+            status_msg_time = time.time()
+        
+        def save_file():
+            """Save current content to file"""
+            nonlocal modified
+            try:
+                # Ensure parent directory exists
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Write content
+                filepath.write_text('\n'.join(content_lines), encoding='utf-8')
+                modified = False
+                set_status(f"✓ Saved to {filepath}")
+                return True
+            except Exception as e:
+                set_status(f"✗ Save failed: {e}")
+                return False
+        
+        def run_script():
+            """Run the current script"""
+            nonlocal modified, filepath, content_lines
+            
+            if modified:
+                if not confirm_destructive_action("save before running (unsaved changes will be lost)"):
+                    set_status("Run cancelled")
+                    return
+            
+            # Save if needed
+            if modified:
+                save_file()
+            
+            set_status("Running script...")
+            display_editor()
+            
+            try:
+                # Run the script
+                content = '\n'.join(content_lines)
+                lines = content.splitlines()
+                
+                # Save context
+                prev_file = State.script_file
+                prev_dir = State.script_dir
+                prev_args = State.script_args
+                
+                try:
+                    State.script_file = str(filepath)
+                    State.script_dir = str(filepath.parent)
+                    State.script_args = []
+                    
+                    print("\n" + "="*80)
+                    print(f"Running: {filepath.name}")
+                    print("="*80 + "\n")
+                    
+                    Interpreter.run_lines(lines)
+                finally:
+                    State.script_file = prev_file
+                    State.script_dir = prev_dir
+                    State.script_args = prev_args
+                
+                wait_for_any_key("\nPress any key to return to editor...")
+            except Exception as e:
+                set_status(f"✗ Run failed: {e}")
+                wait_for_any_key("Press any key to continue...")
+        
+        def handle_input():
+            """Handle keyboard input"""
+            nonlocal cursor_pos, cursor_col, content_lines, editing, modified, filepath, scroll_offset
+            
+            try:
+                # For cross-platform key reading
+                if HAS_MSVCRT:
+                    # Windows
+                    ch = msvcrt.getch()
+                    if ch == b'\xe0':  # Extended key (arrows, etc.)
+                        ch2 = msvcrt.getch()
+                        if ch2 == b'H':  # Up arrow
+                            cursor_pos = max(0, cursor_pos - 1)
+                            cursor_col = min(cursor_col, len(content_lines[cursor_pos]) if cursor_pos < len(content_lines) else 0)
+                        elif ch2 == b'P':  # Down arrow
+                            cursor_pos = min(len(content_lines), cursor_pos + 1)
+                            cursor_col = min(cursor_col, len(content_lines[cursor_pos]) if cursor_pos < len(content_lines) else 0)
+                        elif ch2 == b'K':  # Left arrow
+                            cursor_col = max(0, cursor_col - 1)
+                        elif ch2 == b'M':  # Right arrow
+                            current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                            cursor_col = min(len(current_line), cursor_col + 1)
+                        return
+                    elif ch == b'\r':  # Enter/Return
+                        # Insert new line
+                        current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                        before_cursor = current_line[:cursor_col]
+                        after_cursor = current_line[cursor_col:]
+                        
+                        if cursor_pos >= len(content_lines):
+                            content_lines.append(before_cursor)
+                            content_lines.append(after_cursor)
+                        else:
+                            content_lines[cursor_pos] = before_cursor
+                            content_lines.insert(cursor_pos + 1, after_cursor)
+                        
+                        cursor_pos += 1
+                        cursor_col = 0
+                        modified = True
+                    elif ch == b'\x08' or ch == b'\x7f':  # Backspace
+                        if cursor_col > 0:
+                            # Delete character before cursor
+                            current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                            content_lines[cursor_pos] = current_line[:cursor_col-1] + current_line[cursor_col:]
+                            cursor_col -= 1
+                            modified = True
+                        elif cursor_pos > 0:
+                            # Merge with previous line
+                            prev_line = content_lines[cursor_pos - 1]
+                            current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                            content_lines[cursor_pos - 1] = prev_line + current_line
+                            del content_lines[cursor_pos]
+                            cursor_pos -= 1
+                            cursor_col = len(prev_line)
+                            modified = True
+                    elif ch == b'\x1b':  # Escape
+                        # Check for Ctrl+ combinations
+                        try:
+                            ch2 = msvcrt.getch(timeout=0.1)
+                            if ch2 == b'\x00':
+                                ch3 = msvcrt.getch(timeout=0.1)
+                                # Handle function keys if needed
+                                pass
+                        except:
+                            pass
+                    else:
+                        # Regular character
+                        char = ch.decode('utf-8', errors='ignore')
+                        
+                        # Check for Ctrl+key combinations
+                        if ch == b'\x13':  # Ctrl+S (Save)
+                            save_file()
+                        elif ch == b'\x12':  # Ctrl+R (Run)
+                            run_script()
+                        elif ch == b'\x11':  # Ctrl+Q (Quit)
+                            if modified:
+                                if confirm_destructive_action("quit without saving"):
+                                    editing = False
+                            else:
+                                editing = False
+                        elif ch == b'\x0f':  # Ctrl+O (Open)
+                            try:
+                                termios_available = HAS_UNIX_TERM
+                                if termios_available:
+                                    import termios
+                                    fd = sys.stdin.fileno()
+                                    old_settings = termios.tcgetattr(fd)
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                
+                                new_file = input("Open file: ").strip()
+                                
+                                if termios_available:
+                                    import tty
+                                    tty.setraw(fd)
+                                
+                                if new_file:
+                                    # Switch to new file
+                                    filepath = resolve_path(new_file)
+                                    if filepath.exists():
+                                        content = filepath.read_text(encoding='utf-8')
+                                        content_lines = content.splitlines()
+                                        cursor_pos = 0
+                                        cursor_col = 0
+                                        scroll_offset = 0
+                                        modified = False
+                                        set_status(f"✓ Opened {filepath.name}")
+                                    else:
+                                        set_status(f"✗ File not found: {new_file}")
+                            except Exception as e:
+                                set_status(f"Error: {e}")
+                        elif ch == b'\x06':  # Ctrl+F (Find)
+                            try:
+                                termios_available = HAS_UNIX_TERM
+                                if termios_available:
+                                    import termios
+                                    fd = sys.stdin.fileno()
+                                    old_settings = termios.tcgetattr(fd)
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                
+                                search_term = input("Find: ").strip()
+                                
+                                if termios_available:
+                                    import tty
+                                    tty.setraw(fd)
+                                
+                                if search_term:
+                                    found = False
+                                    for i in range(cursor_pos + 1, len(content_lines)):
+                                        if search_term in content_lines[i]:
+                                            cursor_pos = i
+                                            cursor_col = content_lines[i].find(search_term)
+                                            found = True
+                                            break
+                                    if not found:
+                                        set_status(f"✗ '{search_term}' not found")
+                            except Exception as e:
+                                set_status(f"Error: {e}")
+                        else:
+                            # Insert character
+                            if cursor_pos >= len(content_lines):
+                                content_lines.append(char)
+                            else:
+                                current_line = content_lines[cursor_pos]
+                                content_lines[cursor_pos] = current_line[:cursor_col] + char + current_line[cursor_col:]
+                            cursor_col += 1
+                            modified = True
+                
+                elif HAS_UNIX_TERM:
+                    # Unix/Linux - simplified implementation
+                    import termios, tty
+                    fd = sys.stdin.fileno()
+                    old_settings = termios.tcgetattr(fd)
+                    try:
+                        tty.setraw(fd)
+                        ch = sys.stdin.read(1)
+                        
+                        if ch == '\x1b':  # Escape sequence
+                            # Check for arrow keys
+                            ch2 = sys.stdin.read(1)
+                            if ch2 == '[':
+                                ch3 = sys.stdin.read(1)
+                                if ch3 == 'A':  # Up
+                                    cursor_pos = max(0, cursor_pos - 1)
+                                    cursor_col = min(cursor_col, len(content_lines[cursor_pos]) if cursor_pos < len(content_lines) else 0)
+                                elif ch3 == 'B':  # Down
+                                    cursor_pos = min(len(content_lines), cursor_pos + 1)
+                                    cursor_col = min(cursor_col, len(content_lines[cursor_pos]) if cursor_pos < len(content_lines) else 0)
+                                elif ch3 == 'C':  # Right
+                                    current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                                    cursor_col = min(len(current_line), cursor_col + 1)
+                                elif ch3 == 'D':  # Left
+                                    cursor_col = max(0, cursor_col - 1)
+                        elif ch == '\r' or ch == '\n':  # Enter
+                            current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                            before_cursor = current_line[:cursor_col]
+                            after_cursor = current_line[cursor_col:]
+                            
+                            if cursor_pos >= len(content_lines):
+                                content_lines.append(before_cursor)
+                                content_lines.append(after_cursor)
+                            else:
+                                content_lines[cursor_pos] = before_cursor
+                                content_lines.insert(cursor_pos + 1, after_cursor)
+                            
+                            cursor_pos += 1
+                            cursor_col = 0
+                            modified = True
+                        elif ch == '\x7f' or ch == '\x08':  # Backspace
+                            if cursor_col > 0:
+                                current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                                content_lines[cursor_pos] = current_line[:cursor_col-1] + current_line[cursor_col:]
+                                cursor_col -= 1
+                                modified = True
+                            elif cursor_pos > 0:
+                                prev_line = content_lines[cursor_pos - 1]
+                                current_line = content_lines[cursor_pos] if cursor_pos < len(content_lines) else ""
+                                content_lines[cursor_pos - 1] = prev_line + current_line
+                                del content_lines[cursor_pos]
+                                cursor_pos -= 1
+                                cursor_col = len(prev_line)
+                                modified = True
+                        elif ch == '\x13':  # Ctrl+S
+                            save_file()
+                        elif ch == '\x12':  # Ctrl+R
+                            run_script()
+                        elif ch == '\x11':  # Ctrl+Q
+                            if modified:
+                                if confirm_destructive_action("quit without saving"):
+                                    editing = False
+                            else:
+                                editing = False
+                        elif ch == '\x0f':  # Ctrl+O
+                            try:
+                                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                new_file = input("Open file: ").strip()
+                                tty.setraw(fd)
+                                if new_file:
+                                    filepath = resolve_path(new_file)
+                                    if filepath.exists():
+                                        content = filepath.read_text(encoding='utf-8')
+                                        content_lines = content.splitlines()
+                                        cursor_pos = 0
+                                        cursor_col = 0
+                                        scroll_offset = 0
+                                        modified = False
+                                        set_status(f"✓ Opened {filepath.name}")
+                                    else:
+                                        set_status(f"✗ File not found: {new_file}")
+                            except Exception as e:
+                                set_status(f"Error: {e}")
+                                tty.setraw(fd)
+                        elif ch == '\x06':  # Ctrl+F
+                            try:
+                                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                search_term = input("Find: ").strip()
+                                tty.setraw(fd)
+                                if search_term:
+                                    found = False
+                                    for i in range(cursor_pos + 1, len(content_lines)):
+                                        if search_term in content_lines[i]:
+                                            cursor_pos = i
+                                            cursor_col = content_lines[i].find(search_term)
+                                            found = True
+                                            break
+                                    if not found:
+                                        set_status(f"✗ '{search_term}' not found")
+                            except Exception as e:
+                                set_status(f"Error: {e}")
+                                tty.setraw(fd)
+                        else:
+                            # Insert character
+                            if cursor_pos >= len(content_lines):
+                                content_lines.append(ch)
+                            else:
+                                current_line = content_lines[cursor_pos]
+                                content_lines[cursor_pos] = current_line[:cursor_col] + ch + current_line[cursor_col:]
+                            cursor_col += 1
+                            modified = True
+                            
+                    finally:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                
+                else:
+                    # Fallback: simple line-based editor
+                    set_status("Advanced editor not available on this platform")
+                    time.sleep(2)
+                    editing = False
+                    
+            except KeyboardInterrupt:
+                # Handle Ctrl+C
+                if confirm_destructive_action("exit editor"):
+                    editing = False
+            except Exception as e:
+                set_status(f"Input error: {e}")
+        
+        # Main editor loop
+        try:
+            while editing:
+                display_editor()
+                handle_input()
+            
+            # Save on exit if modified
+            if modified:
+                if confirm_destructive_action("save before exiting"):
+                    save_file()
+            
+            print(f"\nExited editor. File: {filepath}")
+            set_last_exit(0)
+            
+        except Exception as e:
+            print(f"\n⚠ Editor error: {e}")
             set_last_exit(1)
 
     @staticmethod
@@ -2174,6 +2722,8 @@ COMMAND_REGISTRY = {
     "pin": Commands.pin,
     "prv": Commands.prv,
     "gp": Commands.gp,
+    "ide": Commands.ide,
+    "edit": Commands.ide,
     "case": Commands.case,
     "exit": Commands.exit_cmd,
     "quit": Commands.exit_cmd,
