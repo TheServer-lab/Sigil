@@ -27,6 +27,7 @@ import webbrowser
 import zipfile
 import json
 import re
+import getpass  # Added missing import
 from typing import List, Tuple, Any, Dict, Optional
 from pathlib import Path
 
@@ -484,6 +485,90 @@ class TextProcessor:
         return " ".join(expanded_tokens)
 
 # ============================================================================
+# EXECUTION LOGGING
+# ============================================================================
+
+class ExecutionLogger:
+    """Log all executed commands and scripts"""
+    
+    LOG_FILE = Config.CONFIG_DIR / "uses.log"
+    
+    @staticmethod
+    def init_log_file() -> None:
+        """Initialize the log file with headers if it doesn't exist"""
+        if not ExecutionLogger.LOG_FILE.exists():
+            ExecutionLogger.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(ExecutionLogger.LOG_FILE, "w", encoding="utf-8") as f:
+                f.write("# Sigil Execution Log\n")
+                f.write("# Format: TIMESTAMP | MODE | COMMAND/FILE | EXIT_CODE | WORKING_DIR | USER\n")
+                f.write("# " + "=" * 80 + "\n")
+    
+    @staticmethod
+    def log_execution(mode: str, command: str, exit_code: int = 0) -> None:
+        """
+        Log an execution to the uses.log file
+        
+        Args:
+            mode: "CMD" for command, "SCRIPT" for script file, "REPL" for interactive command
+            command: The command or script path that was executed
+            exit_code: Exit/return code of the execution
+        """
+        try:
+            ExecutionLogger.init_log_file()
+            
+            # Get current user
+            try:
+                user = getpass.getuser()
+            except Exception:
+                user = "unknown"
+            
+            # Sanitize command for logging (remove passwords, etc.)
+            sanitized_cmd = ExecutionLogger._sanitize_command(command)
+            
+            # Format timestamp
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Format log entry
+            log_entry = f"{timestamp} | {mode:6} | {sanitized_cmd:60} | {exit_code:3} | {State.current_dir} | {user}\n"
+            
+            # Write to log file
+            with open(ExecutionLogger.LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(log_entry)
+                
+        except Exception as e:
+            # Don't crash if logging fails
+            pass
+    
+    @staticmethod
+    def _sanitize_command(command: str) -> str:
+        """Sanitize command for logging (remove sensitive data)"""
+        # Remove passwords from commands
+        sanitized = command
+        
+        # Check for common password patterns
+        password_patterns = [
+            r'-p\s+["\']?[^"\'\s]+["\']?',
+            r'--password\s+["\']?[^"\'\s]+["\']?',
+            r'passwd\s*=\s*["\']?[^"\'\s]+["\']?',
+            r'password\s*=\s*["\']?[^"\'\s]+["\']?',
+            r'--key\s+["\']?[^"\'\s]+["\']?',
+            r'--token\s+["\']?[^"\'\s]+["\']?',
+            r'--secret\s+["\']?[^"\'\s]+["\']?',
+        ]
+        
+        for pattern in password_patterns:
+            sanitized = re.sub(pattern, lambda m: m.group(0).split('=')[0] + '=*****' if '=' in m.group(0) else m.group(0).split()[0] + ' *****', sanitized)
+        
+        # Truncate very long commands
+        if len(sanitized) > 100:
+            sanitized = sanitized[:97] + "..."
+        
+        return sanitized
+
+# Initialize the logger at module load
+ExecutionLogger.init_log_file()
+
+# ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
@@ -661,7 +746,6 @@ class GUIPrompt:
                     value = input(f"{field_name} (yes/no): ").strip().lower()
                     result[field_name] = value in ('yes', 'y', 'true', '1')
                 elif field_type == "password":
-                    import getpass
                     result[field_name] = getpass.getpass(f"{field_name}: ")
                 else:
                     result[field_name] = input(f"{field_name}: ")
@@ -817,6 +901,7 @@ class Commands:
         "prv": "prv <name>  — Remove plugin",
         "sdow": "sdow  — Shutdown computer (with confirmation)",
         "shutdown": "shutdown  — Shutdown computer (with confirmation)",
+        "log": "log [show [count] | clear | tail]\n  View or manage execution log",
     }
 
     @staticmethod
@@ -1181,6 +1266,84 @@ class Commands:
             set_last_exit(0)
         except subprocess.CalledProcessError:
             print(f"⚠ Failed to close: {name}")
+            set_last_exit(1)
+
+    @staticmethod
+    def log(args: List[str]) -> None:
+        """View or manage execution log"""
+        if not args or args[0] == "show":
+            # Show recent log entries
+            try:
+                if not ExecutionLogger.LOG_FILE.exists():
+                    print("No execution log found")
+                    set_last_exit(0)
+                    return
+                
+                with open(ExecutionLogger.LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                
+                if len(lines) <= 4:  # Header lines
+                    print("Execution log is empty")
+                    set_last_exit(0)
+                    return
+                
+                # Show last 20 entries by default, or specific number
+                count = 20
+                if args and len(args) > 1 and args[0] == "show":
+                    try:
+                        count = int(args[1])
+                    except (ValueError, TypeError):
+                        pass
+                
+                print(f"\n📝 Execution Log (last {count} entries):")
+                print("=" * 100)
+                # Skip header (first 3 lines)
+                entries = lines[3:]
+                entries.reverse()  # Show newest first
+                
+                for i, entry in enumerate(entries[:count]):
+                    if entry.strip() and not entry.startswith("#"):
+                        print(f"{i+1:3}. {entry.strip()}")
+                
+                print("=" * 100)
+                print(f"Log file: {ExecutionLogger.LOG_FILE}")
+                set_last_exit(0)
+                
+            except Exception as e:
+                print(f"⚠ Error reading log: {e}")
+                set_last_exit(1)
+        
+        elif args[0] == "clear":
+            # Clear the log
+            if confirm_destructive_action("clear the execution log"):
+                try:
+                    ExecutionLogger.init_log_file()
+                    print("✓ Execution log cleared")
+                    set_last_exit(0)
+                except Exception as e:
+                    print(f"⚠ Error clearing log: {e}")
+                    set_last_exit(1)
+        
+        elif args[0] == "tail":
+            # Tail the log file
+            try:
+                import subprocess
+                if os.name == "nt":
+                    # Windows
+                    subprocess.run(["powershell", "-Command", f"Get-Content {ExecutionLogger.LOG_FILE} -Wait -Tail 20"])
+                else:
+                    # Unix/Linux
+                    subprocess.run(["tail", "-f", str(ExecutionLogger.LOG_FILE)])
+                set_last_exit(0)
+            except Exception as e:
+                print(f"⚠ Error tailing log: {e}")
+                set_last_exit(1)
+        
+        else:
+            print("Usage: log [show [count] | clear | tail]")
+            print("  show [count] - Show recent log entries (default: 20)")
+            print("  clear        - Clear the execution log")
+            print("  tail         - Follow the log file in real-time")
             set_last_exit(1)
 
     @staticmethod
@@ -2136,8 +2299,6 @@ class Commands:
     @staticmethod
     def ide(args: List[str]) -> None:
         """Open a simple terminal-based text editor for Sigil code"""
-        import sys
-        
         # Default filename or use provided argument
         if args:
             filename = args[0]
@@ -2413,7 +2574,6 @@ class Commands:
                             try:
                                 termios_available = HAS_UNIX_TERM
                                 if termios_available:
-                                    import termios
                                     fd = sys.stdin.fileno()
                                     old_settings = termios.tcgetattr(fd)
                                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -2421,7 +2581,6 @@ class Commands:
                                 new_file = input("Open file: ").strip()
                                 
                                 if termios_available:
-                                    import tty
                                     tty.setraw(fd)
                                 
                                 if new_file:
@@ -2443,7 +2602,6 @@ class Commands:
                             try:
                                 termios_available = HAS_UNIX_TERM
                                 if termios_available:
-                                    import termios
                                     fd = sys.stdin.fileno()
                                     old_settings = termios.tcgetattr(fd)
                                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -2451,7 +2609,6 @@ class Commands:
                                 search_term = input("Find: ").strip()
                                 
                                 if termios_available:
-                                    import tty
                                     tty.setraw(fd)
                                 
                                 if search_term:
@@ -2478,7 +2635,6 @@ class Commands:
                 
                 elif HAS_UNIX_TERM:
                     # Unix/Linux - simplified implementation
-                    import termios, tty
                     fd = sys.stdin.fileno()
                     old_settings = termios.tcgetattr(fd)
                     try:
@@ -2734,6 +2890,7 @@ COMMAND_REGISTRY = {
     "brk": Commands.brk,
     "sdow": Commands.sdow,
     "shutdown": Commands.shutdown,
+    "log": Commands.log,
 }
 
 # ============================================================================
@@ -2759,7 +2916,7 @@ class Interpreter:
         return labels
 
     @staticmethod
-    def _execute_line(raw_line: str) -> None:
+    def _execute_line(raw_line: str, from_script: bool = False) -> None:
         """Execute a single (non-empty) line after expansion."""
         # Expand aliases and variables before tokenizing for actual execution
         expanded_line = TextProcessor.expand_aliases_and_vars(raw_line)
@@ -2770,18 +2927,61 @@ class Interpreter:
         cmd = tokens[0]
         args = tokens[1:]
 
+        # Skip logging for certain commands
+        skip_logging_commands = ['log', 'undo', 'redo', 'pse', 'wait']
+        
         # direct registry command
         handler = COMMAND_REGISTRY.get(cmd)
         if handler:
-            handler(args)
+            try:
+                handler(args)
+                # Log the execution
+                if cmd not in skip_logging_commands and not State.loading_rc:
+                    ExecutionLogger.log_execution(
+                        "REPL" if not from_script else "CMD",
+                        raw_line.strip(),
+                        State.variables.get('last', 0)
+                    )
+            except SystemExit as e:
+                # Log before exiting
+                if cmd not in skip_logging_commands and not State.loading_rc:
+                    ExecutionLogger.log_execution(
+                        "REPL" if not from_script else "CMD",
+                        raw_line.strip(),
+                        e.code if isinstance(e.code, int) else 0
+                    )
+                raise
+            except Exception as e:
+                # Log even on error
+                if cmd not in skip_logging_commands and not State.loading_rc:
+                    ExecutionLogger.log_execution(
+                        "REPL" if not from_script else "CMD",
+                        raw_line.strip(),
+                        State.variables.get('last', 1)
+                    )
+                raise
             return
 
         # fallback: try running as external command
         try:
             ShellRunner.run_and_print([cmd] + args)
+            # Log external command execution
+            if not State.loading_rc:
+                ExecutionLogger.log_execution(
+                    "EXT" if not from_script else "CMD",
+                    raw_line.strip(),
+                    State.variables.get('last', 0)
+                )
         except Exception as e:
             print(f"⚠ Unknown command or failed to run: {cmd} ({e})")
             set_last_exit(1)
+            # Log failed command
+            if not State.loading_rc:
+                ExecutionLogger.log_execution(
+                    "ERR" if not from_script else "CMD",
+                    raw_line.strip(),
+                    1
+                )
 
     @staticmethod
     def _collect_block(lines: List[str], start_index: int, start_kw: str, end_kw: str) -> Tuple[List[str], int]:
@@ -2809,7 +3009,7 @@ class Interpreter:
         raise SigilError(f"Missing {end_kw} for {start_kw} starting at line {start_index+1}")
 
     @staticmethod
-    def run_lines(lines: List[str], from_rc: bool = False) -> None:
+    def run_lines(lines: List[str], from_rc: bool = False, script_name: str = "") -> None:
         """Run multiple lines with block support"""
         # Strip comments and keep original line structure
         in_block_comment = False
@@ -2876,18 +3076,20 @@ class Interpreter:
 
                     # inline command to repeat
                     inline_cmd = " ".join(tokens[2:])
+                    # FIX: Create block_lines from inline command
+                    block_lines = [inline_cmd]
                     try:
                         if count is None:
                             # infinite until brk or Ctrl-C
                             while True:
                                 try:
-                                    Interpreter._execute_line(inline_cmd)
+                                    Interpreter.run_lines(block_lines, from_rc, script_name)
                                 except BreakException:
                                     break
                         else:
                             for _ in range(count):
                                 try:
-                                    Interpreter._execute_line(inline_cmd)
+                                    Interpreter.run_lines(block_lines, from_rc, script_name)
                                 except BreakException:
                                     break
                         set_last_exit(0)
@@ -3084,7 +3286,7 @@ class Interpreter:
 
             # Regular command execution — may raise BreakException from inside subcommands
             try:
-                Interpreter._execute_line(line)
+                Interpreter._execute_line(line, from_script=bool(script_name))
             except BreakException:
                 # If brk encountered outside a rpt block, propagate upward
                 raise
@@ -3103,9 +3305,13 @@ class Interpreter:
 # ============================================================================
 
 def repl():
-    """Simple interactive read-eval-print loop for Sigil"""
+    """Simple interactive read-eval-print loop for Sigil with logging"""
     RCManager.load()
     print(f"Sigil {Config.VERSION} — Type 'help' for commands. Ctrl-D or 'exit' to quit.")
+    
+    # Log REPL start
+    ExecutionLogger.log_execution("REPL", "REPL started", 0)
+    
     try:
         while True:
             try:
@@ -3117,7 +3323,6 @@ def repl():
                 print()
                 continue
 
-            # Remove comments for the single-line REPL invocation
             stripped, _ = TextProcessor.strip_comments(raw, False)
             if not stripped or not stripped.strip():
                 continue
@@ -3125,11 +3330,12 @@ def repl():
             try:
                 Interpreter.run_lines([stripped])
             except BreakException:
-                # 'brk' outside loop: ignore
                 continue
             except SystemExit as e:
-                # propagate the exit
-                code = e.code if isinstance(e, SystemExit) else 0
+                # Log REPL exit
+                exit_code = e.code if isinstance(e.code, int) else 0
+                ExecutionLogger.log_execution("REPL", "REPL exited", exit_code)
+                code = exit_code
                 RCManager.save()
                 sys.exit(code)
             except Exception as e:
@@ -3138,6 +3344,8 @@ def repl():
     finally:
         try:
             RCManager.save()
+            # Log REPL normal exit
+            ExecutionLogger.log_execution("REPL", "REPL session ended", 0)
         except Exception:
             pass
 
@@ -3175,6 +3383,9 @@ def main():
         State.current_dir = script_path.parent
         
         try:
+            # Log script execution start
+            ExecutionLogger.log_execution("SCRIPT", str(script_path), 0)
+            
             # Read and execute the script
             content = script_path.read_text(encoding="utf-8")
             lines = content.splitlines()
@@ -3182,19 +3393,26 @@ def main():
             print(f"🔮 Running: {script_path.name}")
             print("=" * 60)
             
-            Interpreter.run_lines(lines)
+            Interpreter.run_lines(lines, script_name=str(script_path))
             
             print("=" * 60)
-            print(f"✓ Script completed. Exit code: {State.variables.get('last', 0)}")
+            exit_code = State.variables.get('last', 0)
+            print(f"✓ Script completed. Exit code: {exit_code}")
             
-            # Exit with last exit code
-            sys.exit(State.variables.get('last', 0))
+            # Log script execution completion
+            ExecutionLogger.log_execution("SCRIPT", f"{script_path} completed", exit_code)
+            
+            sys.exit(exit_code)
             
         except SystemExit as e:
-            # Propagate exit commands from the script
-            sys.exit(e.code if isinstance(e.code, int) else 0)
+            # Log script exit
+            exit_code = e.code if isinstance(e.code, int) else 0
+            ExecutionLogger.log_execution("SCRIPT", f"{script_path} exited", exit_code)
+            sys.exit(exit_code)
         except Exception as e:
             print(f"⚠ Script execution failed: {e}")
+            # Log script failure
+            ExecutionLogger.log_execution("SCRIPT", f"{script_path} failed", 1)
             import traceback
             traceback.print_exc()
             sys.exit(1)
