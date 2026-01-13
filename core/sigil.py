@@ -3141,5 +3141,70 @@ def repl():
         except Exception:
             pass
 
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def main():
+    """Main entry point that handles both script files and REPL mode"""
+    # Load RC profile
+    RCManager.load()
+    
+    # Check if we were given a script file as argument
+    if len(sys.argv) > 1:
+        # First argument is the .sig file
+        script_file = sys.argv[1]
+        
+        # Verify it's a .sig file
+        if not script_file.endswith('.sig'):
+            print(f"⚠ Expected .sig file, got: {script_file}")
+            sys.exit(1)
+        
+        if not os.path.exists(script_file):
+            print(f"⚠ Script file not found: {script_file}")
+            sys.exit(1)
+        
+        # Set script context
+        script_path = Path(script_file).resolve()
+        State.script_file = str(script_path)
+        State.script_dir = str(script_path.parent)
+        State.script_args = sys.argv[2:]  # Additional arguments
+        
+        # Change to script's directory
+        original_dir = State.current_dir
+        State.current_dir = script_path.parent
+        
+        try:
+            # Read and execute the script
+            content = script_path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            
+            print(f"🔮 Running: {script_path.name}")
+            print("=" * 60)
+            
+            Interpreter.run_lines(lines)
+            
+            print("=" * 60)
+            print(f"✓ Script completed. Exit code: {State.variables.get('last', 0)}")
+            
+            # Exit with last exit code
+            sys.exit(State.variables.get('last', 0))
+            
+        except SystemExit as e:
+            # Propagate exit commands from the script
+            sys.exit(e.code if isinstance(e.code, int) else 0)
+        except Exception as e:
+            print(f"⚠ Script execution failed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            # Restore original directory
+            State.current_dir = original_dir
+            
+    else:
+        # No arguments, start interactive REPL
+        repl()
+
 if __name__ == "__main__":
-    repl()
+    main()
