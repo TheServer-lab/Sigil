@@ -10,7 +10,7 @@ A feature-rich scripting shell with:
 - Plugin system
 - Cross-platform compatibility
 
-Version: 1.0
+Version: 1.0.0
 License: NOT MIT
 """
 
@@ -64,12 +64,187 @@ except ImportError:
     HAS_TKINTER = False
 
 # ============================================================================
+# UPDATE CHECKER
+# ============================================================================
+
+class UpdateChecker:
+    """Check for updates to Sigil"""
+    
+    VERSION_URL = "https://raw.githubusercontent.com/TheServer-lab/Sigil/main/version.txt"
+    RELEASES_URL = "https://github.com/TheServer-lab/Sigil/releases"
+    
+    @staticmethod
+    def check_for_updates(silent: bool = False, force_check: bool = False) -> bool:
+        """
+        Check if a newer version of Sigil is available
+        
+        Args:
+            silent: If True, don't show any output unless update is available
+            force_check: If True, ignore the check interval and force a check
+            
+        Returns:
+            True if update is available, False otherwise
+        """
+        try:
+            # Don't check too frequently (once per day)
+            if not force_check:
+                last_check_file = Config.CONFIG_DIR / ".last_update_check"
+                if last_check_file.exists():
+                    try:
+                        last_check = float(last_check_file.read_text().strip())
+                        # If checked within last 24 hours, skip
+                        if time.time() - last_check < 86400:  # 24 hours in seconds
+                            return False
+                    except (ValueError, OSError):
+                        pass
+            
+            # Import urllib for HTTP request
+            try:
+                import urllib.request
+                import urllib.error
+                import ssl
+            except ImportError:
+                if not silent:
+                    print("⚠ Update check requires urllib")
+                return False
+            
+            if not silent:
+                print("🔍 Checking for updates...")
+            
+            # Create SSL context to handle certificate verification
+            ssl_context = ssl.create_default_context()
+            
+            # Fetch version file
+            try:
+                request = urllib.request.Request(
+                    UpdateChecker.VERSION_URL,
+                    headers={'User-Agent': f'Sigil/{Config.VERSION}'}
+                )
+                response = urllib.request.urlopen(request, timeout=10, context=ssl_context)
+                remote_version = response.read().decode('utf-8').strip()
+                
+                # Save last check time
+                try:
+                    last_check_file = Config.CONFIG_DIR / ".last_update_check"
+                    last_check_file.write_text(str(time.time()))
+                except OSError:
+                    pass
+                
+                # Compare versions
+                if UpdateChecker._is_newer_version(remote_version, Config.VERSION):
+                    if not silent:
+                        UpdateChecker._show_update_prompt(remote_version)
+                    return True
+                else:
+                    if not silent:
+                        print(f"✓ You're running the latest version ({Config.VERSION})")
+                    return False
+                    
+            except urllib.error.URLError as e:
+                if not silent:
+                    print(f"⚠ Could not check for updates: {e.reason}")
+                return False
+            except Exception as e:
+                if not silent:
+                    print(f"⚠ Update check failed: {e}")
+                return False
+                
+        except Exception as e:
+            if not silent:
+                print(f"⚠ Unexpected error during update check: {e}")
+            return False
+    
+    @staticmethod
+    def _is_newer_version(remote: str, current: str) -> bool:
+        """Compare version strings to see if remote is newer than current"""
+        try:
+            # Split version strings into parts
+            remote_parts = list(map(int, remote.split('.')))
+            current_parts = list(map(int, current.split('.')))
+            
+            # Pad with zeros if needed
+            max_len = max(len(remote_parts), len(current_parts))
+            remote_parts += [0] * (max_len - len(remote_parts))
+            current_parts += [0] * (max_len - len(current_parts))
+            
+            # Compare each part
+            for r, c in zip(remote_parts, current_parts):
+                if r > c:
+                    return True
+                elif r < c:
+                    return False
+            
+            return False  # Versions are equal
+        except (ValueError, AttributeError):
+            # If parsing fails, do string comparison
+            return remote > current
+    
+    @staticmethod
+    def _show_update_prompt(new_version: str) -> None:
+        """Show update notification to user"""
+        print("\n" + "="*60)
+        print("📢 UPDATE AVAILABLE!")
+        print("="*60)
+        print(f"Hello there, it seems like you are using an outdated version of Sigil.")
+        print(f"Current version: {Config.VERSION}")
+        print(f"Latest version:  {new_version}")
+        print("\nWhat's new in the latest version?")
+        print("• Bug fixes and performance improvements")
+        print("• New features and enhancements")
+        print("• Better compatibility")
+        print("\nWould you like to update?")
+        
+        # Check if we have tkinter for graphical prompt
+        if HAS_TKINTER:
+            try:
+                response = messagebox.askyesno(
+                    "Sigil Update Available",
+                    f"Update available!\n\nCurrent: {Config.VERSION}\nLatest: {new_version}\n\n"
+                    f"Click 'Yes' to open the download page, or 'No' to continue.",
+                    icon='info'
+                )
+                if response:
+                    webbrowser.open(UpdateChecker.RELEASES_URL)
+                    print(f"✓ Opened: {UpdateChecker.RELEASES_URL}")
+                else:
+                    print("⚠ Update skipped. You can update manually later.")
+            except Exception:
+                # Fallback to console
+                UpdateChecker._console_update_prompt(new_version)
+        else:
+            UpdateChecker._console_update_prompt(new_version)
+        
+        print("="*60 + "\n")
+    
+    @staticmethod
+    def _console_update_prompt(new_version: str) -> None:
+        """Console-based update prompt"""
+        try:
+            response = input("Open download page? (yes/no): ").strip().lower()
+            if response in ('yes', 'y'):
+                webbrowser.open(UpdateChecker.RELEASES_URL)
+                print(f"✓ Opened: {UpdateChecker.RELEASES_URL}")
+            else:
+                print("⚠ Update skipped. You can update manually using:")
+                print(f"  opnlnk {UpdateChecker.RELEASES_URL}")
+        except (EOFError, KeyboardInterrupt):
+            print("\n⚠ Update check cancelled")
+    
+    @staticmethod
+    def update_command(args: List[str]) -> None:
+        """Check for updates command"""
+        if args and args[0] == "force":
+            UpdateChecker.check_for_updates(silent=False, force_check=True)
+        else:
+            UpdateChecker.check_for_updates(silent=False, force_check=False)
+
+# ============================================================================
 # CONFIGURATION & GLOBALS
 # ============================================================================
 
 class Config:
     """Central configuration"""
-    VERSION = "1.0"
+    VERSION = "1.0.0"
     UNDO_LIMIT = 200
     ALIAS_RECURSION_LIMIT = 20
 
@@ -628,6 +803,239 @@ def confirm_destructive_action(action: str) -> bool:
         return False
 
 # ============================================================================
+# PATH MANAGEMENT COMMANDS
+# ============================================================================
+
+class PathCommands:
+    """Manage system PATH environment variable"""
+
+    @staticmethod
+    def _get_path_separator() -> str:
+        """Get PATH separator for current platform"""
+        return ';' if os.name == 'nt' else ':'
+
+    @staticmethod
+    def _get_path_list() -> List[str]:
+        """Get current PATH as list of directories"""
+        path_str = os.environ.get('PATH', '')
+        separator = PathCommands._get_path_separator()
+        return [p.strip() for p in path_str.split(separator) if p.strip()]
+
+    @staticmethod
+    def _set_path_list(path_list: List[str]) -> None:
+        """Set PATH from list of directories"""
+        separator = PathCommands._get_path_separator()
+        new_path = separator.join(path_list)
+        os.environ['PATH'] = new_path
+        # Also update in State variables
+        State.variables['PATH'] = new_path
+        State.exported_vars.add('PATH')
+
+    @staticmethod
+    def _resolve_dir(dir_path: str) -> Path:
+        """Resolve directory path, expanding variables and making absolute"""
+        expanded = TextProcessor.expand_vars_in_string(dir_path)
+        path = Path(expanded).expanduser()
+        
+        if not path.is_absolute():
+            path = State.current_dir / path
+            
+        return path.resolve()
+
+    @staticmethod
+    def add(args: List[str]) -> None:
+        """Add directory to PATH if not already present"""
+        if not args:
+            print("Usage: path add <directory>")
+            print("Example: path add /usr/local/bin")
+            print("         path add \"C:\\Program Files\\MyApp\\bin\"")
+            set_last_exit(1)
+            return
+
+        dir_path = args[0]
+        resolved_path = PathCommands._resolve_dir(dir_path)
+        
+        # Check if directory exists
+        if not resolved_path.exists():
+            if confirm_destructive_action(f"create directory {resolved_path}"):
+                try:
+                    resolved_path.mkdir(parents=True, exist_ok=True)
+                    print(f"✓ Created directory: {resolved_path}")
+                except Exception as e:
+                    print(f"⚠ Failed to create directory: {e}")
+                    set_last_exit(1)
+                    return
+            else:
+                set_last_exit(1)
+                return
+        
+        if not resolved_path.is_dir():
+            print(f"⚠ Not a directory: {resolved_path}")
+            set_last_exit(1)
+            return
+        
+        # Get current PATH
+        current_paths = PathCommands._get_path_list()
+        dir_str = str(resolved_path)
+        
+        # Check if already in PATH
+        if any(p == dir_str for p in current_paths):
+            print(f"✓ Directory already in PATH: {resolved_path}")
+            set_last_exit(0)
+            return
+        
+        # Add to PATH (at the end)
+        current_paths.append(dir_str)
+        PathCommands._set_path_list(current_paths)
+        
+        print(f"✓ Added to PATH: {resolved_path}")
+        
+        # Also save to profile if not loading RC
+        if not State.loading_rc:
+            # Add a line to RC file for persistence
+            rc_path = RCManager.get_rc_path()
+            try:
+                with open(rc_path, 'a', encoding='utf-8') as f:
+                    f.write(f"\n# PATH addition\n")
+                    f.write(f'path add "{dir_str}"\n')
+            except Exception as e:
+                print(f"⚠ Note: Could not save to .sigilrc: {e}")
+        
+        set_last_exit(0)
+
+    @staticmethod
+    def remove(args: List[str]) -> None:
+        """Remove directory from PATH"""
+        if not args:
+            print("Usage: path remove <directory>")
+            print("Example: path remove /usr/local/bin")
+            print("         path remove \"C:\\Program Files\\MyApp\\bin\"")
+            set_last_exit(1)
+            return
+
+        dir_path = args[0]
+        resolved_path = PathCommands._resolve_dir(dir_path)
+        
+        # Get current PATH
+        current_paths = PathCommands._get_path_list()
+        dir_str = str(resolved_path)
+        
+        # Find and remove the directory
+        new_paths = [p for p in current_paths if p != dir_str]
+        
+        if len(new_paths) == len(current_paths):
+            # Nothing was removed
+            print(f"⚠ Directory not found in PATH: {resolved_path}")
+            print(f"  Use 'path list' to see current PATH entries")
+            set_last_exit(1)
+            return
+        
+        # Update PATH
+        PathCommands._set_path_list(new_paths)
+        
+        print(f"✓ Removed from PATH: {resolved_path}")
+        set_last_exit(0)
+
+    @staticmethod
+    def list(args: List[str]) -> None:
+        """List all directories in PATH"""
+        current_paths = PathCommands._get_path_list()
+        
+        if not current_paths:
+            print("PATH is empty")
+            set_last_exit(0)
+            return
+        
+        print(f"\n📁 PATH Environment Variable ({len(current_paths)} entries):")
+        print("=" * 80)
+        
+        for i, path in enumerate(current_paths, 1):
+            path_obj = Path(path)
+            exists = path_obj.exists() and path_obj.is_dir()
+            status = "✓" if exists else "✗"
+            print(f"{i:3}. {status} {path}")
+            
+            # Show subdirectories if -v flag is used
+            if args and '-v' in args and exists:
+                try:
+                    items = list(path_obj.iterdir())
+                    if items:
+                        for item in items[:5]:  # Show first 5 items
+                            if item.is_dir():
+                                print(f"      📂 {item.name}/")
+                            else:
+                                print(f"      📄 {item.name}")
+                        if len(items) > 5:
+                            print(f"      ... and {len(items) - 5} more")
+                except PermissionError:
+                    print(f"      ⚠ Permission denied")
+                except Exception:
+                    pass
+        
+        print("=" * 80)
+        print(f"Total: {len(current_paths)} directories")
+        set_last_exit(0)
+
+    @staticmethod
+    def has(args: List[str]) -> None:
+        """Check if a directory is in PATH"""
+        if not args:
+            print("Usage: path has <directory>")
+            print("Example: path has /usr/local/bin")
+            set_last_exit(1)
+            return
+
+        dir_path = args[0]
+        resolved_path = PathCommands._resolve_dir(dir_path)
+        
+        # Get current PATH
+        current_paths = PathCommands._get_path_list()
+        dir_str = str(resolved_path)
+        
+        # Check if in PATH
+        if any(p == dir_str for p in current_paths):
+            print(f"yes (found in PATH)")
+            set_last_exit(0)
+        else:
+            print(f"no (not in PATH)")
+            set_last_exit(1)
+
+    @staticmethod
+    def path(args: List[str]) -> None:
+        """Main path command dispatcher"""
+        if not args:
+            print("Usage: path <command> [options]")
+            print("Commands:")
+            print("  add <directory>    - Add directory to PATH if not already present")
+            print("  remove <directory> - Remove directory from PATH")
+            print("  list [-v]          - List all directories in PATH")
+            print("  has <directory>    - Check if directory is in PATH")
+            print("\nExamples:")
+            print("  path add /usr/local/bin")
+            print('  path add "C:\\Tools\\MyApp\\bin"')
+            print("  path remove /old/dir")
+            print("  path list")
+            print("  path list -v       # List with directory contents")
+            print("  path has ~/bin")
+            set_last_exit(1)
+            return
+        
+        subcommand = args[0].lower()
+        sub_args = args[1:]
+        
+        if subcommand == "add":
+            PathCommands.add(sub_args)
+        elif subcommand == "remove":
+            PathCommands.remove(sub_args)
+        elif subcommand == "list":
+            PathCommands.list(sub_args)
+        elif subcommand == "has":
+            PathCommands.has(sub_args)
+        else:
+            print(f"⚠ Unknown path subcommand: {subcommand}")
+            set_last_exit(1)
+
+# ============================================================================
 # GUI UTILITIES
 # ============================================================================
 
@@ -902,6 +1310,9 @@ class Commands:
         "sdow": "sdow  — Shutdown computer (with confirmation)",
         "shutdown": "shutdown  — Shutdown computer (with confirmation)",
         "log": "log [show [count] | clear | tail]\n  View or manage execution log",
+        "path": "path add <directory>  — Add directory to PATH\npath remove <directory>  — Remove directory from PATH\npath list [-v]  — List PATH entries\npath has <directory>  — Check if directory is in PATH",
+        "update": "update [force]  — Check for Sigil updates\n  Use 'update force' to bypass 24-hour check interval",
+        "check-updates": "Alias for 'update'",
     }
 
     @staticmethod
@@ -912,7 +1323,7 @@ class Commands:
             categories = {
                 "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex"],
                 "Process": ["task", "kill", "clo"],
-                "System": ["sdow", "shutdown", "pse"],
+                "System": ["sdow", "shutdown", "pse", "path", "update"],
                 "Output": ["say"],
                 "Math": ["add", "sub", "mul", "div"],
                 "Variables": ["let", "var", "unset", "export", "alia", "unalia"],
@@ -2891,6 +3302,9 @@ COMMAND_REGISTRY = {
     "sdow": Commands.sdow,
     "shutdown": Commands.shutdown,
     "log": Commands.log,
+    "path": PathCommands.path,
+    "update": UpdateChecker.update_command,
+    "check-updates": UpdateChecker.update_command,
 }
 
 # ============================================================================
@@ -3177,7 +3591,6 @@ class Interpreter:
                     l = block_lines[i].strip()
                     if l.startswith("when "):
                         # start of when
-                        # format: when <value1> [or <value2> ...]
                         collecting = True
                         # parse values
                         vals = l[5:].split()
@@ -3309,6 +3722,20 @@ def repl():
     RCManager.load()
     print(f"Sigil {Config.VERSION} — Type 'help' for commands. Ctrl-D or 'exit' to quit.")
     
+    # Check for updates on startup (once per session)
+    try:
+        # Run update check in background to not block startup
+        import threading
+        update_thread = threading.Thread(
+            target=UpdateChecker.check_for_updates,
+            kwargs={'silent': True, 'force_check': False},
+            daemon=True
+        )
+        update_thread.start()
+    except Exception:
+        # If threading fails, just skip the update check
+        pass
+    
     # Log REPL start
     ExecutionLogger.log_execution("REPL", "REPL started", 0)
     
@@ -3357,6 +3784,19 @@ def main():
     """Main entry point that handles both script files and REPL mode"""
     # Load RC profile
     RCManager.load()
+    
+    # Check for updates on startup (only in interactive mode)
+    if len(sys.argv) <= 1:  # Only in REPL mode, not when running scripts
+        try:
+            import threading
+            update_thread = threading.Thread(
+                target=UpdateChecker.check_for_updates,
+                kwargs={'silent': True, 'force_check': False},
+                daemon=True
+            )
+            update_thread.start()
+        except Exception:
+            pass
     
     # Check if we were given a script file as argument
     if len(sys.argv) > 1:
