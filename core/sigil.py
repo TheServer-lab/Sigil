@@ -803,11 +803,11 @@ def confirm_destructive_action(action: str) -> bool:
         return False
 
 # ============================================================================
-# PATH MANAGEMENT COMMANDS
+# PATH MANAGEMENT COMMANDS (renamed to pth)
 # ============================================================================
 
-class PathCommands:
-    """Manage system PATH environment variable"""
+class PthCommands:
+    """Manage system PATH environment variable (now called 'pth')"""
 
     @staticmethod
     def _get_path_separator() -> str:
@@ -818,13 +818,13 @@ class PathCommands:
     def _get_path_list() -> List[str]:
         """Get current PATH as list of directories"""
         path_str = os.environ.get('PATH', '')
-        separator = PathCommands._get_path_separator()
+        separator = PthCommands._get_path_separator()
         return [p.strip() for p in path_str.split(separator) if p.strip()]
 
     @staticmethod
     def _set_path_list(path_list: List[str]) -> None:
         """Set PATH from list of directories"""
-        separator = PathCommands._get_path_separator()
+        separator = PthCommands._get_path_separator()
         new_path = separator.join(path_list)
         os.environ['PATH'] = new_path
         # Also update in State variables
@@ -846,14 +846,14 @@ class PathCommands:
     def add(args: List[str]) -> None:
         """Add directory to PATH if not already present"""
         if not args:
-            print("Usage: path add <directory>")
-            print("Example: path add /usr/local/bin")
-            print("         path add \"C:\\Program Files\\MyApp\\bin\"")
+            print("Usage: pth add <directory>")
+            print("Example: pth add /usr/local/bin")
+            print("         pth add \"C:\\Program Files\\MyApp\\bin\"")
             set_last_exit(1)
             return
 
         dir_path = args[0]
-        resolved_path = PathCommands._resolve_dir(dir_path)
+        resolved_path = PthCommands._resolve_dir(dir_path)
         
         # Check if directory exists
         if not resolved_path.exists():
@@ -875,7 +875,7 @@ class PathCommands:
             return
         
         # Get current PATH
-        current_paths = PathCommands._get_path_list()
+        current_paths = PthCommands._get_path_list()
         dir_str = str(resolved_path)
         
         # Check if already in PATH
@@ -886,7 +886,7 @@ class PathCommands:
         
         # Add to PATH (at the end)
         current_paths.append(dir_str)
-        PathCommands._set_path_list(current_paths)
+        PthCommands._set_path_list(current_paths)
         
         print(f"✓ Added to PATH: {resolved_path}")
         
@@ -897,27 +897,27 @@ class PathCommands:
             try:
                 with open(rc_path, 'a', encoding='utf-8') as f:
                     f.write(f"\n# PATH addition\n")
-                    f.write(f'path add "{dir_str}"\n')
+                    f.write(f'pth add "{dir_str}"\n')
             except Exception as e:
                 print(f"⚠ Note: Could not save to .sigilrc: {e}")
         
         set_last_exit(0)
 
     @staticmethod
-    def remove(args: List[str]) -> None:
+    def rmv(args: List[str]) -> None:
         """Remove directory from PATH"""
         if not args:
-            print("Usage: path remove <directory>")
-            print("Example: path remove /usr/local/bin")
-            print("         path remove \"C:\\Program Files\\MyApp\\bin\"")
+            print("Usage: pth rmv <directory>")
+            print("Example: pth rmv /usr/local/bin")
+            print("         pth rmv \"C:\\Program Files\\MyApp\\bin\"")
             set_last_exit(1)
             return
 
         dir_path = args[0]
-        resolved_path = PathCommands._resolve_dir(dir_path)
+        resolved_path = PthCommands._resolve_dir(dir_path)
         
         # Get current PATH
-        current_paths = PathCommands._get_path_list()
+        current_paths = PthCommands._get_path_list()
         dir_str = str(resolved_path)
         
         # Find and remove the directory
@@ -926,20 +926,20 @@ class PathCommands:
         if len(new_paths) == len(current_paths):
             # Nothing was removed
             print(f"⚠ Directory not found in PATH: {resolved_path}")
-            print(f"  Use 'path list' to see current PATH entries")
+            print(f"  Use 'pth lst' to see current PATH entries")
             set_last_exit(1)
             return
         
         # Update PATH
-        PathCommands._set_path_list(new_paths)
+        PthCommands._set_path_list(new_paths)
         
         print(f"✓ Removed from PATH: {resolved_path}")
         set_last_exit(0)
 
     @staticmethod
-    def list(args: List[str]) -> None:
+    def lst(args: List[str]) -> None:
         """List all directories in PATH"""
-        current_paths = PathCommands._get_path_list()
+        current_paths = PthCommands._get_path_list()
         
         if not current_paths:
             print("PATH is empty")
@@ -980,16 +980,16 @@ class PathCommands:
     def has(args: List[str]) -> None:
         """Check if a directory is in PATH"""
         if not args:
-            print("Usage: path has <directory>")
-            print("Example: path has /usr/local/bin")
+            print("Usage: pth has <directory>")
+            print("Example: pth has /usr/local/bin")
             set_last_exit(1)
             return
 
         dir_path = args[0]
-        resolved_path = PathCommands._resolve_dir(dir_path)
+        resolved_path = PthCommands._resolve_dir(dir_path)
         
         # Get current PATH
-        current_paths = PathCommands._get_path_list()
+        current_paths = PthCommands._get_path_list()
         dir_str = str(resolved_path)
         
         # Check if in PATH
@@ -1001,22 +1001,22 @@ class PathCommands:
             set_last_exit(1)
 
     @staticmethod
-    def path(args: List[str]) -> None:
-        """Main path command dispatcher"""
+    def pth(args: List[str]) -> None:
+        """Main pth command dispatcher (shorter name)"""
         if not args:
-            print("Usage: path <command> [options]")
+            print("Usage: pth <command> [options]")
             print("Commands:")
             print("  add <directory>    - Add directory to PATH if not already present")
-            print("  remove <directory> - Remove directory from PATH")
-            print("  list [-v]          - List all directories in PATH")
+            print("  rmv <directory>    - Remove directory from PATH")
+            print("  lst [-v]           - List all directories in PATH")
             print("  has <directory>    - Check if directory is in PATH")
             print("\nExamples:")
-            print("  path add /usr/local/bin")
-            print('  path add "C:\\Tools\\MyApp\\bin"')
-            print("  path remove /old/dir")
-            print("  path list")
-            print("  path list -v       # List with directory contents")
-            print("  path has ~/bin")
+            print("  pth add /usr/local/bin")
+            print('  pth add "C:\\Tools\\MyApp\\bin"')
+            print("  pth rmv /old/dir")
+            print("  pth lst")
+            print("  pth lst -v       # List with directory contents")
+            print("  pth has ~/bin")
             set_last_exit(1)
             return
         
@@ -1024,15 +1024,15 @@ class PathCommands:
         sub_args = args[1:]
         
         if subcommand == "add":
-            PathCommands.add(sub_args)
-        elif subcommand == "remove":
-            PathCommands.remove(sub_args)
-        elif subcommand == "list":
-            PathCommands.list(sub_args)
+            PthCommands.add(sub_args)
+        elif subcommand == "rmv":
+            PthCommands.rmv(sub_args)
+        elif subcommand == "lst":
+            PthCommands.lst(sub_args)
         elif subcommand == "has":
-            PathCommands.has(sub_args)
+            PthCommands.has(sub_args)
         else:
-            print(f"⚠ Unknown path subcommand: {subcommand}")
+            print(f"⚠ Unknown pth subcommand: {subcommand}")
             set_last_exit(1)
 
 # ============================================================================
@@ -1310,7 +1310,7 @@ class Commands:
         "sdow": "sdow  — Shutdown computer (with confirmation)",
         "shutdown": "shutdown  — Shutdown computer (with confirmation)",
         "log": "log [show [count] | clear | tail]\n  View or manage execution log",
-        "path": "path add <directory>  — Add directory to PATH\npath remove <directory>  — Remove directory from PATH\npath list [-v]  — List PATH entries\npath has <directory>  — Check if directory is in PATH",
+        "pth": "pth add <directory>  — Add directory to PATH\npth rmv <directory>  — Remove directory from PATH\npth lst [-v]  — List PATH entries\npth has <directory>  — Check if directory is in PATH",
         "update": "update [force]  — Check for Sigil updates\n  Use 'update force' to bypass 24-hour check interval",
         "check-updates": "Alias for 'update'",
     }
@@ -1323,7 +1323,7 @@ class Commands:
             categories = {
                 "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex"],
                 "Process": ["task", "kill", "clo"],
-                "System": ["sdow", "shutdown", "pse", "path", "update"],
+                "System": ["sdow", "shutdown", "pse", "pth", "update"],
                 "Output": ["say"],
                 "Math": ["add", "sub", "mul", "div"],
                 "Variables": ["let", "var", "unset", "export", "alia", "unalia"],
@@ -3302,7 +3302,7 @@ COMMAND_REGISTRY = {
     "sdow": Commands.sdow,
     "shutdown": Commands.shutdown,
     "log": Commands.log,
-    "path": PathCommands.path,
+    "pth": PthCommands.pth,
     "update": UpdateChecker.update_command,
     "check-updates": UpdateChecker.update_command,
 }
