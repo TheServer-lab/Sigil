@@ -59,7 +59,7 @@ try:
     HAS_TKINTER = True
 except ImportError:
     tk = None
-    ttk = None
+    tty = None
     messagebox = None
     HAS_TKINTER = False
 
@@ -773,9 +773,6 @@ def parse_number(text: str) -> float | int:
     if text in State.variables:
         text = str(State.variables[text])
 
-    if isinstance(text, (int, float)):
-        return text
-
     # Remove quotes if present
     if isinstance(text, str) and len(text) >= 2:
         if text[0] == '"' and text[-1] == '"':
@@ -857,15 +854,11 @@ class PthCommands:
         
         # Check if directory exists
         if not resolved_path.exists():
-            if confirm_destructive_action(f"create directory {resolved_path}"):
-                try:
-                    resolved_path.mkdir(parents=True, exist_ok=True)
-                    print(f"✓ Created directory: {resolved_path}")
-                except Exception as e:
-                    print(f"⚠ Failed to create directory: {e}")
-                    set_last_exit(1)
-                    return
-            else:
+            try:
+                resolved_path.mkdir(parents=True, exist_ok=True)
+                print(f"✓ Created directory: {resolved_path}")
+            except Exception as e:
+                print(f"⚠ Failed to create directory: {e}")
                 set_last_exit(1)
                 return
         
@@ -886,9 +879,46 @@ class PthCommands:
         
         # Add to PATH (at the end)
         current_paths.append(dir_str)
-        PthCommands._set_path_list(current_paths)
+        
+        # Update PATH in os.environ
+        separator = PthCommands._get_path_separator()
+        new_path = separator.join(current_paths)
+        
+        # Update system environment variable
+        os.environ['PATH'] = new_path
+        
+        # Also update in State variables
+        State.variables['PATH'] = new_path
+        State.exported_vars.add('PATH')
+        
+        # On Windows, we might want to update the system PATH permanently
+        # This is more complex and may require registry edits
+        if os.name == 'nt':
+            try:
+                # Try to update the user PATH in registry
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0, winreg.KEY_ALL_ACCESS) as key:
+                    try:
+                        # Get existing user PATH
+                        user_path, _ = winreg.QueryValueEx(key, 'PATH')
+                    except FileNotFoundError:
+                        user_path = ''
+                    
+                    # Add our directory if not already present
+                    user_paths = user_path.split(separator) if user_path else []
+                    if dir_str not in user_paths:
+                        user_paths.append(dir_str)
+                        new_user_path = separator.join(user_paths)
+                        winreg.SetValueEx(key, 'PATH', 0, winreg.REG_EXPAND_SZ, new_user_path)
+                        print(f"✓ Updated permanent user PATH in registry")
+                    else:
+                        print(f"✓ Directory already in permanent user PATH")
+            except Exception as e:
+                print(f"⚠ Note: Could not update permanent PATH in registry: {e}")
+                print(f"  The PATH change is only for this Sigil session.")
         
         print(f"✓ Added to PATH: {resolved_path}")
+        print(f"  PATH is now: {new_path}")
         
         # Also save to profile if not loading RC
         if not State.loading_rc:
