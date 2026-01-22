@@ -271,6 +271,8 @@ class State:
     variables: Dict[str, Any] = {}
     exported_vars: set = set()
     readonly_vars: set = set()
+    
+    functions: Dict[str, List[str]] = {}  # Store functions with their commands
 
     undo_stack: List[dict] = []
     redo_stack: List[dict] = []
@@ -375,6 +377,15 @@ class RCManager:
                         else:
                             readonly_flag = "-r " if name in State.readonly_vars else ""
                             f.write(f"let {readonly_flag}{name} = {value}\n")
+                    f.write("\n")
+
+                # Save functions
+                if State.functions:
+                    f.write("# Functions\n")
+                    for name, commands in sorted(State.functions.items()):
+                        # Join commands with " nxt " separator
+                        commands_str = " nxt ".join(commands)
+                        f.write(f"fnc {name} {commands_str}\n")
                     f.write("\n")
 
                 # Save exports
@@ -1829,7 +1840,7 @@ class ScriptCommands:
             set_last_exit(1)
 
 # ============================================================================
-# GLOBAL CLEANER COMMAND
+# GLOBAL CLEANER COMMAND (MODIFIED - NO FLAGS)
 # ============================================================================
 
 class GlobalCleaner:
@@ -1853,169 +1864,68 @@ class GlobalCleaner:
     
     @staticmethod
     def gbc(args: List[str]) -> None:
-        """Global Cleaner - reset Sigil environment to clean state
+        """Global Cleaner - reset Sigil environment to clean state (with confirmation)
         
-        Usage: gbc [options]
+        Usage: gbc
         
-        Options:
-          -a, --all       Clear everything (including protected variables)
-          -v, --vars      Clear only variables (keep aliases and undo stack)
-          -p, --plugins   Also remove all installed plugins
-          -f, --force     Skip confirmation prompt
-          -l, --list      List what will be cleared without actually clearing
-          
         This command will:
-          1. Remove all user-defined variables (except protected ones by default)
+          1. Remove all user-defined variables (except protected ones)
           2. Clear all aliases
-          3. Clear undo/redo stacks
-          4. Clear plugin registry (if -p flag used)
-          5. Reset script context (if -a flag used)
+          3. Clear all functions
+          4. Clear undo/redo stacks
           
-        Examples:
-          gbc              # Reset with confirmation (keep protected vars)
-          gbc -f           # Force reset without confirmation
-          gbc -a -f        # Clear everything including protected vars
-          gbc --list       # Show what would be cleared
-          gbc -v           # Clear only variables (keep aliases)
+        It will ask for confirmation before proceeding.
+        
+        Example:
+          gbc  # Asks for confirmation before cleaning
         """
-        # Parse options
-        clear_all = False
-        clear_vars_only = False
-        clear_plugins = False
-        force = False
-        list_only = False
-        
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg in ("-a", "--all"):
-                clear_all = True
-                i += 1
-            elif arg in ("-v", "--vars"):
-                clear_vars_only = True
-                i += 1
-            elif arg in ("-p", "--plugins"):
-                clear_plugins = True
-                i += 1
-            elif arg in ("-f", "--force"):
-                force = True
-                i += 1
-            elif arg in ("-l", "--list"):
-                list_only = True
-                i += 1
-            else:
-                print(f"⚠ Unknown option: {arg}")
-                print("Use: gbc [options] - see 'help gbc' for details")
-                set_last_exit(1)
-                return
-        
-        # Show what will be cleared
+        # Show summary
         print("🔧 Global Cleaner")
         print("=" * 60)
-        
-        if list_only:
-            print("📋 What would be cleared:")
-            
-            # Variables to clear
-            vars_to_clear = []
-            vars_to_keep = []
-            for var in State.variables:
-                if clear_all or var not in GlobalCleaner.PROTECTED_VARS:
-                    vars_to_clear.append(var)
-                else:
-                    vars_to_keep.append(var)
-            
-            print(f"  Variables: {len(vars_to_clear)} to clear, {len(vars_to_keep)} protected")
-            if vars_to_clear:
-                print("    Clearing:", ", ".join(sorted(vars_to_clear)[:10]), 
-                      "..." if len(vars_to_clear) > 10 else "")
-            if vars_to_keep and not clear_all:
-                print("    Keeping: ", ", ".join(sorted(vars_to_keep)[:10]),
-                      "..." if len(vars_to_keep) > 10 else "")
-            
-            # Aliases
-            if not clear_vars_only:
-                print(f"  Aliases: {len(State.aliases)} to clear")
-                if State.aliases:
-                    print("    Clearing:", ", ".join(sorted(State.aliases.keys())[:10]),
-                          "..." if len(State.aliases) > 10 else "")
-            
-            # Undo/Redo stacks
-            if not clear_vars_only:
-                print(f"  Undo stack: {len(State.undo_stack)} entries")
-                print(f"  Redo stack: {len(State.redo_stack)} entries")
-            
-            # Plugins
-            if clear_plugins:
-                print(f"  Plugins: {len(State.plugin_registry)} to remove")
-                if State.plugin_registry:
-                    print("    Removing:", ", ".join(sorted(State.plugin_registry.keys())[:10]),
-                          "..." if len(State.plugin_registry) > 10 else "")
-            
-            # Script context
-            if clear_all:
-                print("  Script context: Will be reset")
-            
-            print("=" * 60)
-            print("Note: Use -f to actually perform the cleanup")
-            set_last_exit(0)
-            return
-        
-        # Show summary
         print("⚠ WARNING: This will reset Sigil's environment!")
         print("\nClearing:")
-        
-        if clear_vars_only:
-            print("  ✓ Variables only (aliases and undo stack preserved)")
-        else:
-            print(f"  ✓ {len(State.aliases)} aliases")
-            print(f"  ✓ {len(State.undo_stack)} undo entries")
-            print(f"  ✓ {len(State.redo_stack)} redo entries")
+        print(f"  ✓ {len(State.aliases)} aliases")
+        print(f"  ✓ {len(State.functions)} functions")
+        print(f"  ✓ {len(State.undo_stack)} undo entries")
+        print(f"  ✓ {len(State.redo_stack)} redo entries")
         
         # Variables summary
         vars_to_clear_count = 0
         vars_to_keep_count = 0
         for var in State.variables:
-            if clear_all or var not in GlobalCleaner.PROTECTED_VARS:
+            if var not in GlobalCleaner.PROTECTED_VARS:
                 vars_to_clear_count += 1
             else:
                 vars_to_keep_count += 1
         
-        print(f"  ✓ {vars_to_clear_count} variables")
-        if vars_to_keep_count > 0 and not clear_all:
-            print(f"  ✗ {vars_to_keep_count} protected variables (use -a to clear all)")
-        
-        if clear_plugins:
-            print(f"  ✓ {len(State.plugin_registry)} plugins")
-        
-        if clear_all:
-            print("  ✓ Script context")
+        print(f"  ✓ {vars_to_clear_count} user variables")
+        if vars_to_keep_count > 0:
+            print(f"  ✗ {vars_to_keep_count} protected variables (not cleared)")
         
         print("=" * 60)
         
-        # Ask for confirmation (unless forced)
-        if not force:
-            try:
-                response = input("Continue? (yes/no): ").strip().lower()
-                if response not in ('yes', 'y'):
-                    print("✗ Cleanup cancelled")
-                    set_last_exit(0)
-                    return
-            except (EOFError, KeyboardInterrupt):
-                print("\n✗ Cleanup cancelled")
+        # Ask for confirmation
+        try:
+            response = input("Continue? (yes/no): ").strip().lower()
+            if response not in ('yes', 'y'):
+                print("✗ Cleanup cancelled")
                 set_last_exit(0)
                 return
+        except (EOFError, KeyboardInterrupt):
+            print("\n✗ Cleanup cancelled")
+            set_last_exit(0)
+            return
         
         # Perform cleanup
         cleared_items = []
         
         try:
-            # 1. Clear variables
+            # 1. Clear variables (except protected ones)
             vars_to_delete = []
             for var_name in list(State.variables.keys()):
-                if clear_all or var_name not in GlobalCleaner.PROTECTED_VARS:
-                    # Don't delete if variable is readonly unless -a flag
-                    if var_name in State.readonly_vars and not clear_all:
+                if var_name not in GlobalCleaner.PROTECTED_VARS:
+                    # Don't delete if variable is readonly
+                    if var_name in State.readonly_vars:
                         print(f"  ⚠ Skipping readonly variable: {var_name}")
                         continue
                     
@@ -2033,60 +1943,29 @@ class GlobalCleaner:
             if vars_to_delete:
                 cleared_items.append(f"{len(vars_to_delete)} variables")
             
-            # 2. Clear readonly vars (except protected ones)
-            if clear_all:
-                # Only clear readonly if -a flag
-                readonly_to_delete = []
-                for var_name in list(State.readonly_vars):
-                    if clear_all or var_name not in GlobalCleaner.PROTECTED_VARS:
-                        readonly_to_delete.append(var_name)
-                
-                for var_name in readonly_to_delete:
-                    State.readonly_vars.remove(var_name)
+            # 2. Clear aliases
+            alias_count = len(State.aliases)
+            if alias_count > 0:
+                State.aliases.clear()
+                cleared_items.append(f"{alias_count} aliases")
             
-            # 3. Clear aliases (if not vars-only mode)
-            if not clear_vars_only:
-                alias_count = len(State.aliases)
-                if alias_count > 0:
-                    State.aliases.clear()
-                    cleared_items.append(f"{alias_count} aliases")
+            # 3. Clear functions
+            function_count = len(State.functions)
+            if function_count > 0:
+                State.functions.clear()
+                cleared_items.append(f"{function_count} functions")
             
-            # 4. Clear undo/redo stacks (if not vars-only mode)
-            if not clear_vars_only:
-                undo_count = len(State.undo_stack)
-                redo_count = len(State.redo_stack)
-                if undo_count > 0:
-                    State.undo_stack.clear()
-                    cleared_items.append(f"{undo_count} undo entries")
-                if redo_count > 0:
-                    State.redo_stack.clear()
-                    cleared_items.append(f"{redo_count} redo entries")
+            # 4. Clear undo/redo stacks
+            undo_count = len(State.undo_stack)
+            redo_count = len(State.redo_stack)
+            if undo_count > 0:
+                State.undo_stack.clear()
+                cleared_items.append(f"{undo_count} undo entries")
+            if redo_count > 0:
+                State.redo_stack.clear()
+                cleared_items.append(f"{redo_count} redo entries")
             
-            # 5. Clear plugins (if requested)
-            if clear_plugins:
-                plugin_count = len(State.plugin_registry)
-                if plugin_count > 0:
-                    # Note: This only clears the registry, not the actual files
-                    # Use 'prv' command to remove actual plugin files
-                    State.plugin_registry.clear()
-                    cleared_items.append(f"{plugin_count} plugins (registry only)")
-            
-            # 6. Reset script context (if -a flag)
-            if clear_all:
-                # Save current directory
-                current_dir = State.current_dir
-                
-                # Reset script context
-                State.script_file = ""
-                State.script_dir = ""
-                State.script_args = []
-                
-                # Restore current directory
-                State.current_dir = current_dir
-                
-                cleared_items.append("script context")
-            
-            # 7. Save the clean state to RC file
+            # 5. Save the clean state to RC file
             if not State.loading_rc:
                 try:
                     RCManager.save()
@@ -2098,8 +1977,8 @@ class GlobalCleaner:
                 print(f"\n✅ Global cleanup complete!")
                 print(f"   Cleared: {', '.join(cleared_items)}")
                 
-                # Show remaining protected variables (if any)
-                if not clear_all and State.variables:
+                # Show remaining protected variables
+                if State.variables:
                     protected_vars = [v for v in State.variables.keys() if v in GlobalCleaner.PROTECTED_VARS]
                     if protected_vars:
                         print(f"   Protected: {len(protected_vars)} variables kept")
@@ -2113,6 +1992,259 @@ class GlobalCleaner:
             import traceback
             traceback.print_exc()
             set_last_exit(1)
+    
+    @staticmethod
+    def cnf(args: List[str]) -> None:
+        """Confirm Clean - reset Sigil environment without confirmation
+        
+        Usage: cnf
+        
+        This command does the same as 'gbc' but without asking for confirmation.
+        
+        Example:
+          cnf  # Clears everything immediately without confirmation
+        """
+        # Show summary
+        print("🔧 Global Cleaner (No Confirmation)")
+        print("=" * 60)
+        
+        # Perform cleanup directly
+        cleared_items = []
+        
+        try:
+            # 1. Clear variables (except protected ones)
+            vars_to_delete = []
+            for var_name in list(State.variables.keys()):
+                if var_name not in GlobalCleaner.PROTECTED_VARS:
+                    # Don't delete if variable is readonly
+                    if var_name in State.readonly_vars:
+                        continue
+                    
+                    # Remove from exported vars
+                    if var_name in State.exported_vars:
+                        State.exported_vars.remove(var_name)
+                        # Also remove from environment
+                        if var_name in os.environ:
+                            del os.environ[var_name]
+                    
+                    # Remove from variables dict
+                    del State.variables[var_name]
+                    vars_to_delete.append(var_name)
+            
+            if vars_to_delete:
+                cleared_items.append(f"{len(vars_to_delete)} variables")
+            
+            # 2. Clear aliases
+            alias_count = len(State.aliases)
+            if alias_count > 0:
+                State.aliases.clear()
+                cleared_items.append(f"{alias_count} aliases")
+            
+            # 3. Clear functions
+            function_count = len(State.functions)
+            if function_count > 0:
+                State.functions.clear()
+                cleared_items.append(f"{function_count} functions")
+            
+            # 4. Clear undo/redo stacks
+            undo_count = len(State.undo_stack)
+            redo_count = len(State.redo_stack)
+            if undo_count > 0:
+                State.undo_stack.clear()
+                cleared_items.append(f"{undo_count} undo entries")
+            if redo_count > 0:
+                State.redo_stack.clear()
+                cleared_items.append(f"{redo_count} redo entries")
+            
+            # 5. Save the clean state to RC file
+            if not State.loading_rc:
+                try:
+                    RCManager.save()
+                except Exception as e:
+                    print(f"  ⚠ Could not save clean state: {e}")
+            
+            # Show completion message
+            if cleared_items:
+                print(f"✅ Global cleanup complete!")
+                print(f"   Cleared: {', '.join(cleared_items)}")
+            else:
+                print("✅ Nothing to clean (already clean)")
+            
+            set_last_exit(0)
+            
+        except Exception as e:
+            print(f"\n❌ Cleanup failed: {e}")
+            import traceback
+            traceback.print_exc()
+            set_last_exit(1)
+
+# ============================================================================
+# FUNCTION COMMANDS (NEW)
+# ============================================================================
+
+class FunctionCommands:
+    """Function management commands"""
+    
+    @staticmethod
+    def fnc(args: List[str]) -> None:
+        """Define a function in one line using 'nxt' as separator
+        
+        Usage: fnc <name> <command1> nxt <command2> nxt <command3> ...
+        
+        Example:
+          fnc test mk dir test nxt say made a folder called test nxt pse
+          
+        This creates a function named 'test' that when called will:
+          1. Create a directory named 'test'
+          2. Print "made a folder called test"
+          3. Wait for any key press
+        """
+        if len(args) < 3:
+            print("Usage: fnc <name> <command1> nxt <command2> ...")
+            print("\nExample:")
+            print("  fnc test mk dir test nxt say made a folder called test nxt pse")
+            print("  fnc greet say Hello nxt say World nxt wait 1")
+            set_last_exit(1)
+            return
+        
+        name = args[0]
+        
+        # Join the rest of the arguments
+        rest = " ".join(args[1:])
+        
+        # Split by 'nxt' to get individual commands
+        commands = [cmd.strip() for cmd in rest.split("nxt") if cmd.strip()]
+        
+        if not commands:
+            print(f"⚠ Function '{name}' has no commands")
+            set_last_exit(1)
+            return
+        
+        # Store the function
+        State.functions[name] = commands
+        
+        # Save to RC file if not loading RC
+        if not State.loading_rc:
+            try:
+                RCManager.save()
+            except Exception as e:
+                print(f"⚠ Could not save function to .sigilrc: {e}")
+        
+        print(f"✓ Function '{name}' defined with {len(commands)} command(s)")
+        set_last_exit(0)
+    
+    @staticmethod
+    def clf(args: List[str]) -> None:
+        """Call a previously defined function
+        
+        Usage: clf <name>
+        
+        Example:
+          clf test  # Calls the function named 'test'
+        """
+        if not args:
+            print("Usage: clf <name>")
+            print("\nExample:")
+            print("  clf test")
+            set_last_exit(1)
+            return
+        
+        name = args[0]
+        
+        if name not in State.functions:
+            print(f"⚠ Function not found: {name}")
+            set_last_exit(1)
+            return
+        
+        # Get the function commands
+        commands = State.functions[name]
+        
+        # Execute each command in the function
+        print(f"🔧 Calling function: {name}")
+        
+        for i, cmd in enumerate(commands, 1):
+            # Expand variables in the command before execution
+            expanded_cmd = TextProcessor.expand_aliases_and_vars(cmd)
+            
+            # Log the command execution
+            if not State.loading_rc:
+                ExecutionLogger.log_execution("FUNC", f"{name}: {cmd}", 0)
+            
+            # Execute the command
+            try:
+                # Use the interpreter to execute the command
+                Interpreter._execute_line(expanded_cmd, from_script=True)
+            except SystemExit as e:
+                # If the function calls exit, propagate it
+                raise
+            except BreakException:
+                # If the function calls break, stop executing the function
+                print(f"  ⚠ Break in function '{name}' at command {i}")
+                break
+            except Exception as e:
+                print(f"  ⚠ Error in function '{name}' at command {i}: {e}")
+                print(f"    Command: {cmd}")
+                set_last_exit(1)
+                return
+        
+        print(f"✓ Function '{name}' completed")
+        set_last_exit(0)
+    
+    @staticmethod
+    def fnlist(args: List[str]) -> None:
+        """List all defined functions
+        
+        Usage: fnlist
+        """
+        if not State.functions:
+            print("No functions defined")
+            set_last_exit(0)
+            return
+        
+        print("\n🔧 Defined Functions:\n")
+        for name, commands in sorted(State.functions.items()):
+            print(f"  {name}:")
+            for i, cmd in enumerate(commands, 1):
+                print(f"    {i:2}. {cmd}")
+            print()
+        
+        set_last_exit(0)
+    
+    @staticmethod
+    def fnrm(args: List[str]) -> None:
+        """Remove a function
+        
+        Usage: fnrm <name>
+        
+        Example:
+          fnrm test  # Removes the function named 'test'
+        """
+        if not args:
+            print("Usage: fnrm <name>")
+            print("\nExample:")
+            print("  fnrm test")
+            set_last_exit(1)
+            return
+        
+        name = args[0]
+        
+        if name not in State.functions:
+            print(f"⚠ Function not found: {name}")
+            set_last_exit(1)
+            return
+        
+        # Remove the function
+        del State.functions[name]
+        
+        # Save to RC file if not loading RC
+        if not State.loading_rc:
+            try:
+                RCManager.save()
+            except Exception as e:
+                print(f"⚠ Could not save changes to .sigilrc: {e}")
+        
+        print(f"✓ Function removed: {name}")
+        set_last_exit(0)
 
 # ============================================================================
 # GUI UTILITIES
@@ -2398,9 +2530,12 @@ class Commands:
         "unzip": "Alias for 'uzip'",
         "sns": "sns <script.sig> [arguments...]  — Start new script (ends current script)\n  Alias: exec",
         "exec": "Alias for 'sns'",
-        "gbc": "gbc [options]  — Global cleaner - reset Sigil environment\n  Options:\n    -a, --all    Clear everything including protected variables\n    -v, --vars   Clear only variables (keep aliases)\n    -p, --plugins Also clear plugin registry\n    -f, --force  Skip confirmation\n    -l, --list   List what will be cleared\n  Aliases: clean, reset",
-        "clean": "Alias for 'gbc'",
-        "reset": "Alias for 'gbc'",
+        "gbc": "gbc  — Global cleaner - reset Sigil environment (with confirmation)\n  Alias: clean, reset",
+        "cnf": "cnf  — Global cleaner without confirmation (force clean)",
+        "fnc": "fnc <name> <command1> nxt <command2> ...  — Define a function (one-line, multiple commands separated by 'nxt')",
+        "clf": "clf <name>  — Call a function",
+        "fnlist": "fnlist  — List all defined functions",
+        "fnrm": "fnrm <name>  — Remove a function",
     }
 
     @staticmethod
@@ -2412,15 +2547,16 @@ class Commands:
                 "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex", "zip", "uzip"],
                 "Network": ["net"],
                 "Process": ["task", "kill", "clo"],
-                "System": ["sdow", "shutdown", "pse", "pth", "update", "gbc"],
+                "System": ["sdow", "shutdown", "pse", "pth", "update", "gbc", "cnf"],
                 "Output": ["say"],
                 "Math": ["add", "sub", "mul", "div"],
                 "Variables": ["let", "var", "unset", "export", "alia", "unalia"],
+                "Functions": ["fnc", "clf", "fnlist", "fnrm"],
                 "Control": ["if", "case", "rpt", "goto", "brk", "exit", "wait", "pse"],
                 "I/O": ["ask", "wrt", "gp"],
                 "Scripts": ["run", "inc", "exists", "arg", "sns"],
                 "Editor": ["ide", "edit"],
-                "Config": ["prof", "gbc"],
+                "Config": ["prof"],
                 "Plugins": ["pin", "prv"],
                 "Shell": ["ps", "cmd", "sh"],
             }
@@ -3331,6 +3467,7 @@ class Commands:
         State.variables.clear()
         State.readonly_vars.clear()
         State.exported_vars.clear()
+        State.functions.clear()
 
         path = RCManager.get_rc_path()
         if not path.exists():
@@ -4250,7 +4387,7 @@ class Commands:
                 
                 else:
                     # Fallback: simple line-based editor
-                    set_status("Advanced editor not available on this platform")
+                    set_status(f"Advanced editor not available on this platform")
                     time.sleep(2)
                     editing = False
                     
@@ -4404,6 +4541,11 @@ COMMAND_REGISTRY = {
     "gbc": GlobalCleaner.gbc,
     "clean": GlobalCleaner.gbc,
     "reset": GlobalCleaner.gbc,
+    "cnf": GlobalCleaner.cnf,
+    "fnc": FunctionCommands.fnc,
+    "clf": FunctionCommands.clf,
+    "fnlist": FunctionCommands.fnlist,
+    "fnrm": FunctionCommands.fnrm,
 }
 
 # ============================================================================
