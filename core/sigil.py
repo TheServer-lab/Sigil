@@ -10,7 +10,7 @@ A feature-rich scripting shell with:
 - Plugin system
 - Cross-platform compatibility
 
-Version: 1.0.0
+Version: 1.0.1
 License: NOT MIT
 """
 
@@ -27,7 +27,11 @@ import webbrowser
 import zipfile
 import json
 import re
-import getpass  # Added missing import
+import getpass
+import fnmatch  # Added for pattern matching
+import urllib.request
+import urllib.error
+import ssl
 from typing import List, Tuple, Any, Dict, Optional
 from pathlib import Path
 
@@ -97,16 +101,6 @@ class UpdateChecker:
                             return False
                     except (ValueError, OSError):
                         pass
-            
-            # Import urllib for HTTP request
-            try:
-                import urllib.request
-                import urllib.error
-                import ssl
-            except ImportError:
-                if not silent:
-                    print("⚠ Update check requires urllib")
-                return False
             
             if not silent:
                 print("🔍 Checking for updates...")
@@ -244,7 +238,7 @@ class UpdateChecker:
 
 class Config:
     """Central configuration"""
-    VERSION = "1.0.0"
+    VERSION = "1.0.1"
     UNDO_LIMIT = 200
     ALIAS_RECURSION_LIMIT = 20
 
@@ -1066,6 +1060,1061 @@ class PthCommands:
             set_last_exit(1)
 
 # ============================================================================
+# NETWORK COMMANDS
+# ============================================================================
+
+class NetCommands:
+    """Network-related commands for downloading and pinging"""
+
+    @staticmethod
+    def dwn(args: List[str]) -> None:
+        """Download a file from URL to local path
+        
+        Usage: net dwn <url> [save_path]
+        Example: net dwn https://example.com/file.zip
+                 net dwn https://example.com/file.zip ./downloads/file.zip
+        """
+        if not args:
+            print("Usage: net dwn <url> [save_path]")
+            print("Example: net dwn https://example.com/file.zip")
+            print("         net dwn https://example.com/file.zip ./downloads/file.zip")
+            set_last_exit(1)
+            return
+
+        url = args[0]
+        
+        # Determine save path
+        if len(args) >= 2:
+            save_path = resolve_path(args[1])
+        else:
+            # Extract filename from URL
+            filename = url.split('/')[-1]
+            if '?' in filename:  # Remove query parameters
+                filename = filename.split('?')[0]
+            if not filename:
+                filename = f"download_{int(time.time())}.bin"
+            save_path = State.current_dir / filename
+        
+        try:
+            # Create SSL context (allow self-signed certs for local networks)
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Ensure save directory exists
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            print(f"⬇️  Downloading: {url}")
+            print(f"   Destination: {save_path}")
+            
+            # Create a user agent header
+            headers = {'User-Agent': f'Sigil/{Config.VERSION}'}
+            request = urllib.request.Request(url, headers=headers)
+            
+            # Show progress
+            start_time = time.time()
+            
+            def show_progress(block_num, block_size, total_size):
+                downloaded = block_num * block_size
+                if total_size > 0:
+                    percent = min(100, (downloaded * 100) / total_size)
+                    # Show progress every 5% or for every 1MB
+                    if block_num % max(1, int(total_size / block_size / 20)) == 0 or downloaded % (1024 * 1024) == 0:
+                        mb_downloaded = downloaded / (1024 * 1024)
+                        if total_size > 0:
+                            mb_total = total_size / (1024 * 1024)
+                            print(f"   Progress: {percent:.1f}% ({mb_downloaded:.1f} MB / {mb_total:.1f} MB)", end='\r')
+                        else:
+                            print(f"   Progress: {mb_downloaded:.1f} MB downloaded", end='\r')
+            
+            # Download with progress
+            urllib.request.urlretrieve(
+                url, 
+                str(save_path),
+                reporthook=show_progress,
+                context=ssl_context
+            )
+            
+            # Clear progress line and show completion
+            print(" " * 80, end='\r')
+            
+            # Verify download
+            if save_path.exists():
+                file_size = save_path.stat().st_size
+                elapsed = time.time() - start_time
+                speed = file_size / elapsed / (1024 * 1024) if elapsed > 0 else 0
+                
+                print(f"✓ Download complete!")
+                print(f"  File: {save_path}")
+                print(f"  Size: {file_size:,} bytes ({file_size/(1024*1024):.2f} MB)")
+                print(f"  Time: {elapsed:.2f} seconds")
+                print(f"  Speed: {speed:.2f} MB/s")
+                set_last_exit(0)
+            else:
+                print(f"⚠ Download failed - file not created")
+                set_last_exit(1)
+                
+        except urllib.error.HTTPError as e:
+            print(f"⚠ HTTP Error {e.code}: {e.reason}")
+            set_last_exit(1)
+        except urllib.error.URLError as e:
+            print(f"⚠ URL Error: {e.reason}")
+            set_last_exit(1)
+        except ssl.SSLError as e:
+            print(f"⚠ SSL Error: {e}")
+            set_last_exit(1)
+        except Exception as e:
+            print(f"⚠ Download failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def png(args: List[str]) -> None:
+        """Ping a host to check network connectivity
+        
+        Usage: net png <host> [count]
+        Example: net png google.com
+                 net png 8.8.8.8 5
+                 net png localhost 3
+        """
+        if not args:
+            print("Usage: net png <host> [count]")
+            print("Example: net png google.com")
+            print("         net png 8.8.8.8 5")
+            print("         net png localhost 3")
+            set_last_exit(1)
+            return
+
+        host = args[0]
+        count = 4  # Default ping count
+        
+        if len(args) >= 2:
+            try:
+                count = int(args[1])
+                if count < 1:
+                    count = 1
+                elif count > 100:
+                    count = 100
+                    print("⚠ Limiting to 100 pings maximum")
+            except (ValueError, TypeError):
+                print(f"⚠ Invalid count, using default (4)")
+        
+        print(f"🔄 Pinging {host} {count} times...")
+        
+        try:
+            if os.name == "nt":
+                # Windows ping command
+                cmd = ["ping", "-n", str(count), host]
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore'
+                )
+                
+                # Parse Windows ping output
+                output = result.stdout
+                lines = output.split('\n')
+                
+                # Find summary lines
+                for line in lines:
+                    if "Packets:" in line or "Sent =" in line:
+                        print(line.strip())
+                    elif "Approximate round trip times" in line or "Minimum =" in line:
+                        print(line.strip())
+                    elif "Request timed out" in line:
+                        print("⚠ Request timed out")
+                
+                if result.returncode == 0:
+                    print(f"✓ {host} is reachable")
+                else:
+                    print(f"✗ {host} is not reachable (or ping blocked)")
+                    
+            else:
+                # Unix/Linux ping command
+                cmd = ["ping", "-c", str(count), host]
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore'
+                )
+                
+                # Parse Unix ping output
+                output = result.stdout
+                lines = output.split('\n')
+                
+                # Show relevant ping statistics
+                for line in lines:
+                    if "packets transmitted" in line or "rtt min/avg/max" in line:
+                        print(line.strip())
+                    elif "PING" in line and line.startswith("PING"):
+                        # Show the ping command echo
+                        pass
+                
+                if result.returncode == 0:
+                    print(f"✓ {host} is reachable")
+                else:
+                    print(f"✗ {host} is not reachable (or ping blocked)")
+            
+            set_last_exit(result.returncode)
+            
+        except FileNotFoundError:
+            print("⚠ Ping command not found. Make sure you have network utilities installed.")
+            set_last_exit(127)
+        except Exception as e:
+            print(f"⚠ Ping failed: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def net(args: List[str]) -> None:
+        """Network utilities - download and ping
+        
+        Usage: net <command> [arguments]
+        Commands:
+          dwn <url> [save_path]    - Download file from URL
+          png <host> [count]       - Ping host (1-100 times)
+        """
+        if not args:
+            print("Usage: net <command> [arguments]")
+            print("Commands:")
+            print("  dwn <url> [save_path]    - Download file from URL")
+            print("  png <host> [count]       - Ping host (1-100 times)")
+            print("\nExamples:")
+            print("  net dwn https://example.com/file.zip")
+            print("  net dwn https://example.com/file.zip ./downloads/file.zip")
+            print("  net png google.com")
+            print("  net png 8.8.8.8 5")
+            print("  net png localhost 3")
+            set_last_exit(1)
+            return
+        
+        subcommand = args[0].lower()
+        sub_args = args[1:]
+        
+        if subcommand == "dwn":
+            NetCommands.dwn(sub_args)
+        elif subcommand == "png":
+            NetCommands.png(sub_args)
+        else:
+            print(f"⚠ Unknown net subcommand: {subcommand}")
+            print("  Use: dwn (download) or png (ping)")
+            set_last_exit(1)
+
+# ============================================================================
+# ARCHIVE COMMANDS (ZIP/UNZIP)
+# ============================================================================
+
+class ArchiveCommands:
+    """Archive operations - zip and unzip files"""
+
+    @staticmethod
+    def zip(args: List[str]) -> None:
+        """Create a zip archive
+        
+        Usage: zip <archive.zip> <file1> <file2> ... [options]
+               zip <archive.zip> -d <directory> [options]
+        
+        Options:
+          -d, --dir   Zip an entire directory
+          -r, --recurse  Recurse into subdirectories (default: True)
+          -x, --exclude <pattern>  Exclude files matching pattern
+          
+        Examples:
+          zip archive.zip file1.txt file2.jpg
+          zip backup.zip -d ./myfolder
+          zip project.zip -d ./project -x "*.tmp"
+        """
+        if not args:
+            print("Usage: zip <archive.zip> <file1> <file2> ... [options]")
+            print("       zip <archive.zip> -d <directory> [options]")
+            print("\nOptions:")
+            print("  -d, --dir <directory>   Zip an entire directory")
+            print("  -r, --recurse           Recurse into subdirectories (default: True)")
+            print("  -x, --exclude <pattern> Exclude files matching pattern")
+            print("\nExamples:")
+            print("  zip archive.zip file1.txt file2.jpg")
+            print("  zip backup.zip -d ./myfolder")
+            print("  zip project.zip -d ./project -x \"*.tmp\"")
+            set_last_exit(1)
+            return
+
+        # Parse arguments
+        archive_path = resolve_path(args[0])
+        files_to_zip = []
+        dir_to_zip = None
+        recurse = True
+        exclude_patterns = []
+        
+        i = 1
+        while i < len(args):
+            arg = args[i]
+            if arg in ("-d", "--dir"):
+                if i + 1 >= len(args):
+                    print("⚠ Missing directory path after -d")
+                    set_last_exit(1)
+                    return
+                dir_to_zip = resolve_path(args[i + 1])
+                i += 2
+            elif arg in ("-r", "--recurse"):
+                recurse = True
+                i += 1
+            elif arg in ("-nr", "--no-recurse"):
+                recurse = False
+                i += 1
+            elif arg in ("-x", "--exclude"):
+                if i + 1 >= len(args):
+                    print("⚠ Missing pattern after -x")
+                    set_last_exit(1)
+                    return
+                exclude_patterns.append(args[i + 1])
+                i += 2
+            else:
+                # Treat as a file to zip
+                files_to_zip.append(resolve_path(arg))
+                i += 1
+        
+        try:
+            # Ensure archive has .zip extension
+            if not str(archive_path).lower().endswith('.zip'):
+                archive_path = Path(str(archive_path) + '.zip')
+            
+            # Check if archive already exists
+            if archive_path.exists():
+                if not confirm_destructive_action(f"overwrite existing archive {archive_path.name}"):
+                    print("✗ Operation cancelled")
+                    set_last_exit(1)
+                    return
+            
+            print(f"📦 Creating archive: {archive_path.name}")
+            
+            if dir_to_zip:
+                # Zip a directory
+                if not dir_to_zip.exists():
+                    print(f"⚠ Directory not found: {dir_to_zip}")
+                    set_last_exit(1)
+                    return
+                
+                if not dir_to_zip.is_dir():
+                    print(f"⚠ Not a directory: {dir_to_zip}")
+                    set_last_exit(1)
+                    return
+                
+                # Count files for progress
+                file_count = 0
+                if recurse:
+                    for root, dirs, files in os.walk(dir_to_zip):
+                        # Apply exclude patterns
+                        for pattern in exclude_patterns:
+                            files = [f for f in files if not fnmatch.fnmatch(f, pattern)]
+                        file_count += len(files)
+                else:
+                    file_count = len([f for f in dir_to_zip.iterdir() if f.is_file()])
+                
+                print(f"  Source: {dir_to_zip}")
+                print(f"  Files to archive: {file_count}")
+                
+                # Create the zip file
+                with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    if recurse:
+                        for root, dirs, files in os.walk(dir_to_zip):
+                            # Apply exclude patterns
+                            for pattern in exclude_patterns:
+                                files = [f for f in files if not fnmatch.fnmatch(f, pattern)]
+                            
+                            for file in files:
+                                file_path = Path(root) / file
+                                # Create relative path for archive
+                                rel_path = file_path.relative_to(dir_to_zip)
+                                zipf.write(file_path, rel_path)
+                                
+                                # Show progress every 10 files
+                                if file_count > 10 and len(zipf.namelist()) % 10 == 0:
+                                    progress = len(zipf.namelist()) / file_count * 100
+                                    print(f"  Progress: {progress:.1f}% ({len(zipf.namelist())}/{file_count})", end='\r')
+                    else:
+                        # Only top-level files
+                        for item in dir_to_zip.iterdir():
+                            if item.is_file():
+                                # Apply exclude patterns
+                                skip = False
+                                for pattern in exclude_patterns:
+                                    if fnmatch.fnmatch(item.name, pattern):
+                                        skip = True
+                                        break
+                                if skip:
+                                    continue
+                                    
+                                zipf.write(item, item.name)
+                
+            elif files_to_zip:
+                # Zip specific files
+                print(f"  Files to archive: {len(files_to_zip)}")
+                
+                # Check if files exist
+                for file_path in files_to_zip:
+                    if not file_path.exists():
+                        print(f"⚠ File not found: {file_path}")
+                        set_last_exit(1)
+                        return
+                
+                # Create the zip file
+                with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for i, file_path in enumerate(files_to_zip):
+                        zipf.write(file_path, file_path.name)
+                        
+                        # Show progress
+                        progress = (i + 1) / len(files_to_zip) * 100
+                        print(f"  Progress: {progress:.1f}% ({i + 1}/{len(files_to_zip)})", end='\r')
+            else:
+                print("⚠ No files or directory specified to zip")
+                set_last_exit(1)
+                return
+            
+            # Clear progress line
+            print(" " * 80, end='\r')
+            
+            # Show archive info
+            archive_size = archive_path.stat().st_size
+            with zipfile.ZipFile(archive_path, 'r') as zipf:
+                file_count = len(zipf.namelist())
+            
+            print(f"✓ Archive created: {archive_path.name}")
+            print(f"  Size: {archive_size:,} bytes ({archive_size/(1024*1024):.2f} MB)")
+            print(f"  Files: {file_count}")
+            set_last_exit(0)
+            
+        except Exception as e:
+            print(f"⚠ Failed to create archive: {e}")
+            # Clean up partial archive if it exists
+            if archive_path.exists():
+                try:
+                    archive_path.unlink()
+                except:
+                    pass
+            set_last_exit(1)
+
+    @staticmethod
+    def uzip(args: List[str]) -> None:
+        """Extract a zip archive
+        
+        Usage: uzip <archive.zip> [destination] [options]
+        
+        Options:
+          -d, --dir <path>     Extract to specific directory
+          -l, --list           List contents without extracting
+          -o, --overwrite      Overwrite existing files without asking
+          -q, --quiet          Quiet mode (minimal output)
+          
+        Examples:
+          uzip archive.zip
+          uzip archive.zip ./extracted
+          uzip archive.zip -l
+          uzip archive.zip -d ./output
+        """
+        if not args:
+            print("Usage: uzip <archive.zip> [destination] [options]")
+            print("\nOptions:")
+            print("  -d, --dir <path>     Extract to specific directory")
+            print("  -l, --list           List contents without extracting")
+            print("  -o, --overwrite      Overwrite existing files without asking")
+            print("  -q, --quiet          Quiet mode (minimal output)")
+            print("\nExamples:")
+            print("  uzip archive.zip")
+            print("  uzip archive.zip ./extracted")
+            print("  uzip archive.zip -l")
+            print("  uzip archive.zip -d ./output")
+            set_last_exit(1)
+            return
+
+        # Parse arguments
+        archive_path = None
+        extract_dir = None
+        list_only = False
+        overwrite = False
+        quiet = False
+        
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            
+            if arg in ("-d", "--dir"):
+                if i + 1 >= len(args):
+                    print("⚠ Missing directory path after -d")
+                    set_last_exit(1)
+                    return
+                extract_dir = resolve_path(args[i + 1])
+                i += 2
+            elif arg in ("-l", "--list"):
+                list_only = True
+                i += 1
+            elif arg in ("-o", "--overwrite"):
+                overwrite = True
+                i += 1
+            elif arg in ("-q", "--quiet"):
+                quiet = True
+                i += 1
+            else:
+                # This should be the archive path (only one archive allowed)
+                if archive_path is None:
+                    archive_path = resolve_path(arg)
+                    i += 1
+                else:
+                    # If we already have an archive, treat as extract directory (positional)
+                    if extract_dir is None:
+                        extract_dir = resolve_path(arg)
+                        i += 1
+                    else:
+                        print(f"⚠ Unexpected argument: {arg}")
+                        set_last_exit(1)
+                        return
+        
+        if archive_path is None:
+            print("⚠ No archive file specified")
+            set_last_exit(1)
+            return
+        
+        # Check if archive exists
+        if not archive_path.exists():
+            print(f"⚠ Archive not found: {archive_path}")
+            set_last_exit(1)
+            return
+        
+        try:
+            # Open the zip file
+            with zipfile.ZipFile(archive_path, 'r') as zipf:
+                # List contents
+                if list_only:
+                    print(f"📦 Contents of {archive_path.name}:")
+                    print("=" * 80)
+                    
+                    # Get file info
+                    file_list = zipf.infolist()
+                    total_size = sum(f.file_size for f in file_list)
+                    compressed_size = sum(f.compress_size for f in file_list)
+                    
+                    # List files
+                    for file_info in file_list:
+                        # Format the date
+                        date_str = f"{file_info.date_time[0]}-{file_info.date_time[1]:02d}-{file_info.date_time[2]:02d}"
+                        
+                        # Show directory vs file
+                        if file_info.filename.endswith('/'):
+                            icon = "📁"
+                            size_str = "     DIR"
+                        else:
+                            icon = "📄"
+                            size_str = f"{file_info.file_size:8,}"
+                        
+                        print(f"{icon} {date_str} {size_str} {file_info.filename}")
+                    
+                    print("=" * 80)
+                    print(f"Total files: {len(file_list)}")
+                    print(f"Uncompressed size: {total_size:,} bytes ({total_size/(1024*1024):.2f} MB)")
+                    print(f"Compressed size: {compressed_size:,} bytes ({compressed_size/(1024*1024):.2f} MB)")
+                    
+                    if total_size > 0:
+                        ratio = (1 - compressed_size / total_size) * 100
+                        print(f"Compression ratio: {ratio:.1f}%")
+                    
+                    set_last_exit(0)
+                    return
+                
+                # Determine extraction directory
+                if extract_dir is None:
+                    # Default: extract to current directory with archive name (without .zip)
+                    archive_name = archive_path.stem
+                    extract_dir = State.current_dir / archive_name
+                else:
+                    extract_dir = extract_dir.resolve()
+                
+                # Create extraction directory if it doesn't exist
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Count files for progress
+                file_list = zipf.namelist()
+                file_count = len(file_list)
+                
+                if not quiet:
+                    print(f"📦 Extracting: {archive_path.name}")
+                    print(f"  Destination: {extract_dir}")
+                    print(f"  Files to extract: {file_count}")
+                
+                # Extract files
+                extracted_count = 0
+                skipped_count = 0
+                error_count = 0
+                
+                for i, filename in enumerate(file_list):
+                    # Determine destination path
+                    dest_path = extract_dir / filename
+                    
+                    # Skip if it's a directory entry
+                    if filename.endswith('/'):
+                        dest_path.mkdir(parents=True, exist_ok=True)
+                        continue
+                    
+                    # Check if file already exists
+                    if dest_path.exists() and not overwrite:
+                        if not quiet:
+                            print(f"  ⚠ Skipping (exists): {filename}")
+                        skipped_count += 1
+                        continue
+                    
+                    try:
+                        # Create parent directory if needed
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # Extract the file
+                        zipf.extract(filename, extract_dir)
+                        extracted_count += 1
+                        
+                        if not quiet and file_count > 10:
+                            progress = (i + 1) / file_count * 100
+                            print(f"  Progress: {progress:.1f}% ({i + 1}/{file_count})", end='\r')
+                            
+                    except Exception as e:
+                        if not quiet:
+                            print(f"  ⚠ Failed to extract {filename}: {e}")
+                        error_count += 1
+                
+                # Clear progress line
+                if not quiet and file_count > 10:
+                    print(" " * 80, end='\r')
+                
+                # Show summary
+                if not quiet:
+                    print(f"✓ Extraction complete!")
+                    print(f"  Extracted: {extracted_count} files")
+                    if skipped_count > 0:
+                        print(f"  Skipped: {skipped_count} files (already exist)")
+                    if error_count > 0:
+                        print(f"  Errors: {error_count} files")
+                    print(f"  Location: {extract_dir}")
+                else:
+                    # Quiet mode: just show basic info
+                    print(f"Extracted {extracted_count} files to {extract_dir}")
+                
+                set_last_exit(0 if error_count == 0 else 1)
+                
+        except zipfile.BadZipFile:
+            print(f"⚠ Invalid or corrupted zip file: {archive_path}")
+            set_last_exit(1)
+        except Exception as e:
+            print(f"⚠ Failed to extract archive: {e}")
+            set_last_exit(1)
+
+    @staticmethod
+    def unzip(args: List[str]) -> None:
+        """Alias for uzip command"""
+        ArchiveCommands.uzip(args)
+
+# ============================================================================
+# SCRIPT CONTROL COMMAND
+# ============================================================================
+
+class ScriptCommands:
+    """Script control commands - start new scripts"""
+
+    @staticmethod
+    def sns(args: List[str]) -> None:
+        """Start New Script - end current script and execute new one
+        
+        Usage: sns <script.sig> [arguments...]
+        
+        This command immediately terminates the current script and starts
+        executing the specified script. The new script runs in the same
+        environment (variables, aliases, etc.) but with new script arguments.
+        
+        Example:
+          sns backup.sig            # Run backup.sig now
+          sns install.sig --force   # Run install.sig with --force argument
+        """
+        if not args:
+            print("Usage: sns <script.sig> [arguments...]")
+            print("\nExample:")
+            print("  sns backup.sig")
+            print("  sns install.sig --force")
+            set_last_exit(1)
+            return
+
+        script_file = args[0]
+        
+        # Remove quotes if present
+        if script_file.startswith('"') and script_file.endswith('"'):
+            script_file = script_file[1:-1]
+        elif script_file.startswith("'") and script_file.endswith("'"):
+            script_file = script_file[1:-1]
+        
+        # Expand variables in the script path
+        script_file = TextProcessor.expand_vars_in_string(script_file)
+        
+        # Resolve the script path
+        script_path = resolve_path(script_file)
+        
+        # Check if script exists
+        if not script_path.exists():
+            print(f"⚠ Script not found: {script_path}")
+            set_last_exit(1)
+            return
+        
+        # Check if it's a .sig file
+        if not str(script_path).lower().endswith('.sig'):
+            print(f"⚠ Not a Sigil script (.sig file): {script_path}")
+            set_last_exit(1)
+            return
+        
+        print(f"🔄 Starting new script: {script_path.name}")
+        print("=" * 60)
+        
+        # Save current state
+        original_dir = State.current_dir
+        original_script_file = State.script_file
+        original_script_dir = State.script_dir
+        original_script_args = State.script_args[:]  # Copy list
+        
+        try:
+            # Set new script context
+            State.script_file = str(script_path)
+            State.script_dir = str(script_path.parent)
+            State.script_args = args[1:] if len(args) > 1 else []
+            
+            # Change to script's directory
+            State.current_dir = script_path.parent
+            
+            # Read and execute the new script
+            content = script_path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            
+            # Log the script switch
+            ExecutionLogger.log_execution("SNS", f"Switched to: {script_path}", 0)
+            
+            # Clear undo stack for new script context
+            State.undo_stack.clear()
+            State.redo_stack.clear()
+            
+            # Execute the new script
+            Interpreter.run_lines(lines, script_name=str(script_path))
+            
+            print("=" * 60)
+            exit_code = State.variables.get('last', 0)
+            print(f"✓ New script completed. Exit code: {exit_code}")
+            
+            # Log completion
+            ExecutionLogger.log_execution("SNS", f"Completed: {script_path}", exit_code)
+            
+            # Terminate the current script by raising SystemExit
+            # This will bubble up through the call stack
+            sys.exit(exit_code)
+            
+        except SystemExit as e:
+            # Re-raise the SystemExit to propagate it
+            raise
+        except Exception as e:
+            print(f"⚠ Failed to execute new script: {e}")
+            # Restore original context
+            State.current_dir = original_dir
+            State.script_file = original_script_file
+            State.script_dir = original_script_dir
+            State.script_args = original_script_args
+            
+            # Log failure
+            ExecutionLogger.log_execution("SNS", f"Failed: {script_path}", 1)
+            
+            import traceback
+            traceback.print_exc()
+            set_last_exit(1)
+
+# ============================================================================
+# GLOBAL CLEANER COMMAND
+# ============================================================================
+
+class GlobalCleaner:
+    """Global cleaner - reset Sigil environment to clean state"""
+    
+    # List of protected variables that should NOT be cleared
+    PROTECTED_VARS = {
+        'last', 'LAST', 'LAST_EXIT',  # Exit code tracking
+        'PATH',  # System PATH
+        'HOME', 'USER', 'USERNAME',   # User info
+        'PWD', 'OLDPWD',              # Directory tracking
+        'OS', 'OSTYPE',               # OS info
+        'HOSTNAME', 'HOST',           # Host info
+        'SHELL', 'TERM',              # Shell/Terminal info
+        'TEMP', 'TMP', 'TMPDIR',      # Temp directories
+        'LANG', 'LC_ALL',             # Locale settings
+        'PROCESSOR_ARCHITECTURE',     # CPU architecture
+        'NUMBER_OF_PROCESSORS',       # CPU count
+        'COMPUTERNAME',               # Computer name
+    }
+    
+    @staticmethod
+    def gbc(args: List[str]) -> None:
+        """Global Cleaner - reset Sigil environment to clean state
+        
+        Usage: gbc [options]
+        
+        Options:
+          -a, --all       Clear everything (including protected variables)
+          -v, --vars      Clear only variables (keep aliases and undo stack)
+          -p, --plugins   Also remove all installed plugins
+          -f, --force     Skip confirmation prompt
+          -l, --list      List what will be cleared without actually clearing
+          
+        This command will:
+          1. Remove all user-defined variables (except protected ones by default)
+          2. Clear all aliases
+          3. Clear undo/redo stacks
+          4. Clear plugin registry (if -p flag used)
+          5. Reset script context (if -a flag used)
+          
+        Examples:
+          gbc              # Reset with confirmation (keep protected vars)
+          gbc -f           # Force reset without confirmation
+          gbc -a -f        # Clear everything including protected vars
+          gbc --list       # Show what would be cleared
+          gbc -v           # Clear only variables (keep aliases)
+        """
+        # Parse options
+        clear_all = False
+        clear_vars_only = False
+        clear_plugins = False
+        force = False
+        list_only = False
+        
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg in ("-a", "--all"):
+                clear_all = True
+                i += 1
+            elif arg in ("-v", "--vars"):
+                clear_vars_only = True
+                i += 1
+            elif arg in ("-p", "--plugins"):
+                clear_plugins = True
+                i += 1
+            elif arg in ("-f", "--force"):
+                force = True
+                i += 1
+            elif arg in ("-l", "--list"):
+                list_only = True
+                i += 1
+            else:
+                print(f"⚠ Unknown option: {arg}")
+                print("Use: gbc [options] - see 'help gbc' for details")
+                set_last_exit(1)
+                return
+        
+        # Show what will be cleared
+        print("🔧 Global Cleaner")
+        print("=" * 60)
+        
+        if list_only:
+            print("📋 What would be cleared:")
+            
+            # Variables to clear
+            vars_to_clear = []
+            vars_to_keep = []
+            for var in State.variables:
+                if clear_all or var not in GlobalCleaner.PROTECTED_VARS:
+                    vars_to_clear.append(var)
+                else:
+                    vars_to_keep.append(var)
+            
+            print(f"  Variables: {len(vars_to_clear)} to clear, {len(vars_to_keep)} protected")
+            if vars_to_clear:
+                print("    Clearing:", ", ".join(sorted(vars_to_clear)[:10]), 
+                      "..." if len(vars_to_clear) > 10 else "")
+            if vars_to_keep and not clear_all:
+                print("    Keeping: ", ", ".join(sorted(vars_to_keep)[:10]),
+                      "..." if len(vars_to_keep) > 10 else "")
+            
+            # Aliases
+            if not clear_vars_only:
+                print(f"  Aliases: {len(State.aliases)} to clear")
+                if State.aliases:
+                    print("    Clearing:", ", ".join(sorted(State.aliases.keys())[:10]),
+                          "..." if len(State.aliases) > 10 else "")
+            
+            # Undo/Redo stacks
+            if not clear_vars_only:
+                print(f"  Undo stack: {len(State.undo_stack)} entries")
+                print(f"  Redo stack: {len(State.redo_stack)} entries")
+            
+            # Plugins
+            if clear_plugins:
+                print(f"  Plugins: {len(State.plugin_registry)} to remove")
+                if State.plugin_registry:
+                    print("    Removing:", ", ".join(sorted(State.plugin_registry.keys())[:10]),
+                          "..." if len(State.plugin_registry) > 10 else "")
+            
+            # Script context
+            if clear_all:
+                print("  Script context: Will be reset")
+            
+            print("=" * 60)
+            print("Note: Use -f to actually perform the cleanup")
+            set_last_exit(0)
+            return
+        
+        # Show summary
+        print("⚠ WARNING: This will reset Sigil's environment!")
+        print("\nClearing:")
+        
+        if clear_vars_only:
+            print("  ✓ Variables only (aliases and undo stack preserved)")
+        else:
+            print(f"  ✓ {len(State.aliases)} aliases")
+            print(f"  ✓ {len(State.undo_stack)} undo entries")
+            print(f"  ✓ {len(State.redo_stack)} redo entries")
+        
+        # Variables summary
+        vars_to_clear_count = 0
+        vars_to_keep_count = 0
+        for var in State.variables:
+            if clear_all or var not in GlobalCleaner.PROTECTED_VARS:
+                vars_to_clear_count += 1
+            else:
+                vars_to_keep_count += 1
+        
+        print(f"  ✓ {vars_to_clear_count} variables")
+        if vars_to_keep_count > 0 and not clear_all:
+            print(f"  ✗ {vars_to_keep_count} protected variables (use -a to clear all)")
+        
+        if clear_plugins:
+            print(f"  ✓ {len(State.plugin_registry)} plugins")
+        
+        if clear_all:
+            print("  ✓ Script context")
+        
+        print("=" * 60)
+        
+        # Ask for confirmation (unless forced)
+        if not force:
+            try:
+                response = input("Continue? (yes/no): ").strip().lower()
+                if response not in ('yes', 'y'):
+                    print("✗ Cleanup cancelled")
+                    set_last_exit(0)
+                    return
+            except (EOFError, KeyboardInterrupt):
+                print("\n✗ Cleanup cancelled")
+                set_last_exit(0)
+                return
+        
+        # Perform cleanup
+        cleared_items = []
+        
+        try:
+            # 1. Clear variables
+            vars_to_delete = []
+            for var_name in list(State.variables.keys()):
+                if clear_all or var_name not in GlobalCleaner.PROTECTED_VARS:
+                    # Don't delete if variable is readonly unless -a flag
+                    if var_name in State.readonly_vars and not clear_all:
+                        print(f"  ⚠ Skipping readonly variable: {var_name}")
+                        continue
+                    
+                    # Remove from exported vars
+                    if var_name in State.exported_vars:
+                        State.exported_vars.remove(var_name)
+                        # Also remove from environment
+                        if var_name in os.environ:
+                            del os.environ[var_name]
+                    
+                    # Remove from variables dict
+                    del State.variables[var_name]
+                    vars_to_delete.append(var_name)
+            
+            if vars_to_delete:
+                cleared_items.append(f"{len(vars_to_delete)} variables")
+            
+            # 2. Clear readonly vars (except protected ones)
+            if clear_all:
+                # Only clear readonly if -a flag
+                readonly_to_delete = []
+                for var_name in list(State.readonly_vars):
+                    if clear_all or var_name not in GlobalCleaner.PROTECTED_VARS:
+                        readonly_to_delete.append(var_name)
+                
+                for var_name in readonly_to_delete:
+                    State.readonly_vars.remove(var_name)
+            
+            # 3. Clear aliases (if not vars-only mode)
+            if not clear_vars_only:
+                alias_count = len(State.aliases)
+                if alias_count > 0:
+                    State.aliases.clear()
+                    cleared_items.append(f"{alias_count} aliases")
+            
+            # 4. Clear undo/redo stacks (if not vars-only mode)
+            if not clear_vars_only:
+                undo_count = len(State.undo_stack)
+                redo_count = len(State.redo_stack)
+                if undo_count > 0:
+                    State.undo_stack.clear()
+                    cleared_items.append(f"{undo_count} undo entries")
+                if redo_count > 0:
+                    State.redo_stack.clear()
+                    cleared_items.append(f"{redo_count} redo entries")
+            
+            # 5. Clear plugins (if requested)
+            if clear_plugins:
+                plugin_count = len(State.plugin_registry)
+                if plugin_count > 0:
+                    # Note: This only clears the registry, not the actual files
+                    # Use 'prv' command to remove actual plugin files
+                    State.plugin_registry.clear()
+                    cleared_items.append(f"{plugin_count} plugins (registry only)")
+            
+            # 6. Reset script context (if -a flag)
+            if clear_all:
+                # Save current directory
+                current_dir = State.current_dir
+                
+                # Reset script context
+                State.script_file = ""
+                State.script_dir = ""
+                State.script_args = []
+                
+                # Restore current directory
+                State.current_dir = current_dir
+                
+                cleared_items.append("script context")
+            
+            # 7. Save the clean state to RC file
+            if not State.loading_rc:
+                try:
+                    RCManager.save()
+                except Exception as e:
+                    print(f"  ⚠ Could not save clean state: {e}")
+            
+            # Show completion message
+            if cleared_items:
+                print(f"\n✅ Global cleanup complete!")
+                print(f"   Cleared: {', '.join(cleared_items)}")
+                
+                # Show remaining protected variables (if any)
+                if not clear_all and State.variables:
+                    protected_vars = [v for v in State.variables.keys() if v in GlobalCleaner.PROTECTED_VARS]
+                    if protected_vars:
+                        print(f"   Protected: {len(protected_vars)} variables kept")
+            else:
+                print("\n✅ Nothing to clean (already clean)")
+            
+            set_last_exit(0)
+            
+        except Exception as e:
+            print(f"\n❌ Cleanup failed: {e}")
+            import traceback
+            traceback.print_exc()
+            set_last_exit(1)
+
+# ============================================================================
 # GUI UTILITIES
 # ============================================================================
 
@@ -1343,25 +2392,35 @@ class Commands:
         "pth": "pth add <directory>  — Add directory to PATH\npth rmv <directory>  — Remove directory from PATH\npth lst [-v]  — List PATH entries\npth has <directory>  — Check if directory is in PATH",
         "update": "update [force]  — Check for Sigil updates\n  Use 'update force' to bypass 24-hour check interval",
         "check-updates": "Alias for 'update'",
+        "net": "net dwn <url> [save_path]  — Download file from URL\nnet png <host> [count]  — Ping host (1-100 times)",
+        "zip": "zip <archive.zip> <file1> <file2> ...  — Create zip archive\nzip <archive.zip> -d <directory>  — Zip entire directory",
+        "uzip": "uzip <archive.zip> [destination]  — Extract zip archive\nuzip <archive.zip> -l  — List archive contents",
+        "unzip": "Alias for 'uzip'",
+        "sns": "sns <script.sig> [arguments...]  — Start new script (ends current script)\n  Alias: exec",
+        "exec": "Alias for 'sns'",
+        "gbc": "gbc [options]  — Global cleaner - reset Sigil environment\n  Options:\n    -a, --all    Clear everything including protected variables\n    -v, --vars   Clear only variables (keep aliases)\n    -p, --plugins Also clear plugin registry\n    -f, --force  Skip confirmation\n    -l, --list   List what will be cleared\n  Aliases: clean, reset",
+        "clean": "Alias for 'gbc'",
+        "reset": "Alias for 'gbc'",
     }
 
     @staticmethod
     def help(args: List[str]) -> None:
         """Show help information"""
         if not args:
-            print("\n🔮 Sigil Commands:\n")
+            print("\n🔮 Sigil Commands (v1.0.1):\n")
             categories = {
-                "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex"],
+                "Files": ["mk", "cpy", "dlt", "move", "cd", "pwd", "dirlook", "opn", "opnlnk", "ex", "zip", "uzip"],
+                "Network": ["net"],
                 "Process": ["task", "kill", "clo"],
-                "System": ["sdow", "shutdown", "pse", "pth", "update"],
+                "System": ["sdow", "shutdown", "pse", "pth", "update", "gbc"],
                 "Output": ["say"],
                 "Math": ["add", "sub", "mul", "div"],
                 "Variables": ["let", "var", "unset", "export", "alia", "unalia"],
                 "Control": ["if", "case", "rpt", "goto", "brk", "exit", "wait", "pse"],
                 "I/O": ["ask", "wrt", "gp"],
-                "Scripts": ["run", "inc", "exists", "arg"],
+                "Scripts": ["run", "inc", "exists", "arg", "sns"],
                 "Editor": ["ide", "edit"],
-                "Config": ["prof"],
+                "Config": ["prof", "gbc"],
                 "Plugins": ["pin", "prv"],
                 "Shell": ["ps", "cmd", "sh"],
             }
@@ -1376,6 +2435,7 @@ class Commands:
 
             print("Type: help <command> for details\n")
             print("Comments: & # // single-line, /* */ block comments\n")
+            print(f"Version: {Config.VERSION}")
             return
 
         cmd_name = args[0]
@@ -3335,6 +4395,15 @@ COMMAND_REGISTRY = {
     "pth": PthCommands.pth,
     "update": UpdateChecker.update_command,
     "check-updates": UpdateChecker.update_command,
+    "net": NetCommands.net,
+    "zip": ArchiveCommands.zip,
+    "uzip": ArchiveCommands.uzip,
+    "unzip": ArchiveCommands.unzip,
+    "sns": ScriptCommands.sns,
+    "exec": ScriptCommands.sns,
+    "gbc": GlobalCleaner.gbc,
+    "clean": GlobalCleaner.gbc,
+    "reset": GlobalCleaner.gbc,
 }
 
 # ============================================================================
